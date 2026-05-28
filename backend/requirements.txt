@@ -1,0 +1,45 @@
+# =====================================================
+# AuditAI — FREE STACK
+#   - LLM:        Google Gemini API (free tier, hosted)
+#   - Embeddings: sentence-transformers (local, free)
+# =====================================================
+
+# FastAPI Web Framework
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.27
+asyncpg==0.29.0
+alembic==1.13.1
+pgvector==0.2.5
+
+# Authentication & Security
+bcrypt==4.1.2
+PyJWT==2.8.0
+python-dotenv==1.0.1
+
+# File Parsing
+PyMuPDF==1.23.26
+openpyxl==3.1.2
+pytesseract==0.3.10
+Pillow==10.2.0
+
+# --- FREE AI providers ---
+# LLM (Gemini free tier)
+google-generativeai==0.7.2
+
+# Local embeddings (downloads model on first run, ~80 MB)
+sentence-transformers==2.7.0
+torch==2.2.2
+# NumPy must be <2 for PyTorch 2.2 compatibility — do NOT remove this pin
+numpy<2
+
+# Validation
+pydantic==2.6.3
+email-validator==2.1.1
+
+# --- OPTIONAL paid providers (uncomment if you ever want to switch back) ---
+# openai==1.13.3
+# anthropic==0.18.1

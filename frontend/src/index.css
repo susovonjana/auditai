@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Markdown styling inside AI message bubbles */
+.markdown h2 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
+  color: #1e3a8a;
+}
+.markdown h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-top: 0.75rem;
+  margin-bottom: 0.25rem;
+  color: #1e3a8a;
+}
+.markdown p {
+  margin: 0.5rem 0;
+  line-height: 1.6;
+  color: #1f2937;
+}
+.markdown strong { color: #111827; }
+.markdown ul {
+  list-style: disc;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+.markdown ol {
+  list-style: decimal;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+.markdown li { margin: 0.25rem 0; line-height: 1.6; }
+.markdown code {
+  background: #f3f4f6;
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.25rem;
+  font-size: 0.9em;
+}
+.markdown blockquote {
+  border-left: 3px solid #c7d2fe;
+  margin: 0.5rem 0;
+  padding: 0.25rem 0.75rem;
+  color: #374151;
+  background: #f9fafb;
+}
+
+/* Typing dots animation */
+@keyframes blink {
+  0%, 80%, 100% { opacity: 0.2; }
+  40% { opacity: 1; }
+}
+.typing-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 2px;
+  background: #6b7280;
+  border-radius: 50%;
+  animation: blink 1.2s infinite ease-in-out both;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
