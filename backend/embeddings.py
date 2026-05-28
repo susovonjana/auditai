@@ -1,11 +1,14 @@
 """
 Local embeddings via sentence-transformers (FREE).
 
-The model is downloaded once to ~/.cache/huggingface (about 80 MB for
-all-MiniLM-L6-v2) and then runs entirely on your machine — no API key,
-no rate limits, no internet needed after the first download.
+Default model:  BAAI/bge-small-en-v1.5  (384-dim, ~133 MB)
+The model is downloaded once to ~/.cache/huggingface and then runs entirely
+on your machine — no API key, no rate limits, no internet needed after the
+first download.
 
-Output dimension defaults to 384 (configured in config.EMBEDDING_DIMENSIONS).
+bge models work best with an asymmetric prefix on the QUERY side. We embed:
+  - documents (chunks) with no prefix
+  - queries (questions)   with the standard bge instruction prefix
 """
 from __future__ import annotations
 
@@ -17,9 +20,16 @@ from config import EMBEDDING_DIMENSIONS, LOCAL_EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Lazy singleton — loading the model takes a couple of seconds, so we only
-# do it on the first call and keep it in memory afterwards.
+# Lazy singleton — loading takes a few seconds, so we do it once and keep it
 _model: Optional["SentenceTransformer"] = None  # type: ignore[name-defined]
+
+# Recommended instruction prefix for bge-* English models on the query side.
+# Empty for documents.
+_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+
+def _is_bge_model(name: str) -> bool:
+    return name.lower().startswith(("bge", "baai/bge"))
 
 
 def _load_model():
@@ -57,10 +67,25 @@ def _encode_sync(texts: List[str]) -> List[List[float]]:
 
 
 async def embed_text(text: str) -> List[float]:
-    """Return a single embedding vector for a single string."""
+    """Embed a single passage (document chunk). No query prefix."""
     cleaned = (text or "").replace("\n", " ").strip()
     if not cleaned:
         return [0.0] * EMBEDDING_DIMENSIONS
+    vectors = await asyncio.to_thread(_encode_sync, [cleaned])
+    return vectors[0]
+
+
+async def embed_query(question: str) -> List[float]:
+    """
+    Embed a user QUERY (question). For bge-* models we prepend the official
+    instruction prefix, which materially improves retrieval quality.
+    """
+    cleaned = (question or "").replace("\n", " ").strip()
+    if not cleaned:
+        return [0.0] * EMBEDDING_DIMENSIONS
+
+    if _is_bge_model(LOCAL_EMBEDDING_MODEL):
+        cleaned = _QUERY_PREFIX + cleaned
 
     vectors = await asyncio.to_thread(_encode_sync, [cleaned])
     return vectors[0]
@@ -70,15 +95,10 @@ async def embed_texts(
     texts: List[str],
     batch_size: int = 100,  # kept for API compatibility; ignored
 ) -> List[List[float]]:
-    """
-    Embed many strings. Returns a list with the same length and order
-    as the input.
-    """
+    """Embed many document passages (no prefix)."""
     if not texts:
         return []
-
     cleaned = [(t or "").replace("\n", " ").strip() for t in texts]
     safe_batch = [c if c else " " for c in cleaned]
-
     vectors = await asyncio.to_thread(_encode_sync, safe_batch)
     return vectors

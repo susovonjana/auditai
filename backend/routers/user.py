@@ -3,24 +3,26 @@ Public user-facing router.
 
 Endpoints:
   POST /session/start            create a new chat session
-  POST /ask                      ask a question, get a Markdown answer
+  POST /ask                      ask a question, get a Markdown answer (single-shot)
+  POST /ask/stream               ask a question, stream the answer (NDJSON)
   POST /feedback                 submit thumbs up / down
   GET  /session/{token}/history  this session's Q&A history
   GET  /health                   server health probe
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db
+from database import AsyncSessionLocal, get_db
 from models import SearchHistory, UserSession
 import qa
 import schemas
@@ -34,7 +36,11 @@ router = APIRouter(tags=["user"])
 # ---------------------------------------------------------------------------
 @router.get("/health")
 async def health():
-    return {"status": "ok", "service": "AuditAI", "time": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "service": "AuditAI",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +83,7 @@ async def _load_session(db: AsyncSession, token: str) -> UserSession:
 
 
 # ---------------------------------------------------------------------------
-# Ask
+# Ask (non-streaming) — kept for compatibility
 # ---------------------------------------------------------------------------
 @router.post("/ask", response_model=schemas.AskResponse)
 async def ask(
@@ -88,9 +94,8 @@ async def ask(
 
     started = time.perf_counter()
     try:
-        result = await qa.answer_question(db, payload.question)
+        result = await qa.answer_question(db, session.id, payload.question)
     except RuntimeError as exc:
-        # Missing API keys etc.
         logger.exception("Q&A engine config error: %s", exc)
         raise HTTPException(
             status_code=503,
@@ -118,7 +123,6 @@ async def ask(
     )
     db.add(history)
 
-    # Bump session counters
     session.total_questions = (session.total_questions or 0) + 1
     session.last_active_at = datetime.now(timezone.utc)
     await db.commit()
@@ -130,6 +134,116 @@ async def ask(
         was_answered=result.was_answered,
         response_time_ms=elapsed_ms,
         documents_referenced=result.document_filenames,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ask (streaming)
+#
+# Emits newline-delimited JSON over a single HTTP response. Each line is one
+# JSON object:
+#
+#   {"type": "meta",  "documents": ["ISA_315.pdf", ...]}
+#   {"type": "delta", "text": "## From your..."}
+#   {"type": "delta", "text": "knowledge base..."}
+#   ...
+#   {"type": "done",  "history_id": "...", "was_answered": true,
+#    "response_time_ms": 1234}
+# ---------------------------------------------------------------------------
+@router.post("/ask/stream")
+async def ask_stream(
+    payload: schemas.AskRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    session = await _load_session(db, payload.session_token)
+
+    started = time.perf_counter()
+    try:
+        preamble = await qa.prepare_stream(db, session.id, payload.question)
+    except RuntimeError as exc:
+        logger.exception("Stream preamble config error: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="There was a problem generating a response. Please try again.",
+        )
+
+    session_id = session.id
+    question = payload.question
+
+    async def event_stream():
+        accumulated: list[str] = []
+        document_filenames = list({c.document_filename for c in preamble.chunks})
+
+        # Emit metadata first
+        meta = {
+            "type": "meta",
+            "documents": document_filenames,
+            "chunks_found": len(preamble.chunks),
+        }
+        yield json.dumps(meta) + "\n"
+
+        # Stream tokens
+        try:
+            async for piece in qa.stream_answer(preamble, question):
+                accumulated.append(piece)
+                yield json.dumps({"type": "delta", "text": piece}) + "\n"
+        except Exception as exc:
+            logger.exception("Streaming error: %s", exc)
+            yield json.dumps(
+                {"type": "error", "message": "Stream interrupted; please retry."}
+            ) + "\n"
+
+        full_answer = "".join(accumulated).strip() or qa.EMPTY_KB_TEXT
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        was_answered = preamble.was_answered_initial and (
+            "knowledge base does not contain" not in full_answer.lower()
+        )
+
+        # Persist to search_history in a fresh session — the original `db`
+        # session is bound to the HTTP request and may be closing.
+        history_id: str | None = None
+        try:
+            async with AsyncSessionLocal() as bg:
+                history = SearchHistory(
+                    session_id=session_id,
+                    question=question,
+                    question_embedding=preamble.question_embedding or None,
+                    ai_answer=full_answer,
+                    chunks_used=[str(c.chunk_id) for c in preamble.chunks],
+                    documents_referenced=list({str(c.document_id) for c in preamble.chunks}),
+                    similarity_scores=[round(c.similarity, 4) for c in preamble.chunks],
+                    response_time_ms=elapsed_ms,
+                    was_answered=was_answered,
+                    user_feedback=None,
+                )
+                bg.add(history)
+
+                # Bump session counters
+                sess = await bg.get(UserSession, session_id)
+                if sess is not None:
+                    sess.total_questions = (sess.total_questions or 0) + 1
+                    sess.last_active_at = datetime.now(timezone.utc)
+
+                await bg.commit()
+                await bg.refresh(history)
+                history_id = str(history.id)
+        except Exception as exc:
+            logger.exception("Failed to persist streamed answer: %s", exc)
+
+        yield json.dumps(
+            {
+                "type": "done",
+                "history_id": history_id,
+                "was_answered": was_answered,
+                "response_time_ms": elapsed_ms,
+                "documents": document_filenames,
+            }
+        ) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
 
 

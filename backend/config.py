@@ -54,18 +54,30 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Local embeddings (sentence-transformers)
+# bge-small-en-v1.5 is 384-dim and substantially more accurate than MiniLM.
 LOCAL_EMBEDDING_MODEL: str = os.getenv(
-    "LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2"
+    "LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"
 )
 EMBEDDING_DIMENSIONS: int = int(os.getenv("EMBEDDING_DIMENSIONS", "384"))
+
+# Cross-encoder reranker (~80 MB, loaded once at first request)
+RERANKER_MODEL: str = os.getenv(
+    "RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+USE_RERANKER: bool = os.getenv("USE_RERANKER", "true").lower() == "true"
 
 # --- Chunking ---
 CHUNK_SIZE: int = 1000
 CHUNK_OVERLAP: int = 150
 
 # --- Retrieval ---
+# Hybrid: pull more candidates from each retriever, then rerank down to TOP_K.
+INITIAL_CANDIDATES: int = 20
 TOP_K_CHUNKS: int = 8
-SIMILARITY_THRESHOLD: float = 0.30  # below this we consider "no answer found"
+SIMILARITY_THRESHOLD: float = 0.30
+
+# --- Conversation memory ---
+CONVERSATION_MEMORY_TURNS: int = 5
 
 # --- Allowed file extensions ---
 ALLOWED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".png", ".jpg", ".jpeg"}

@@ -40,6 +40,70 @@ export const sendFeedback = (historyId, feedback) =>
 export const getSessionHistory = (token) =>
   api.get(`/session/${token}/history`)
 
+/**
+ * Stream a /ask/stream response. Calls callbacks as events arrive:
+ *   onMeta({documents, chunks_found})
+ *   onDelta(textPiece)
+ *   onDone({history_id, was_answered, response_time_ms, documents})
+ *   onError(message)
+ *
+ * Returns an AbortController so callers can cancel mid-stream.
+ */
+export async function askQuestionStream(
+  sessionToken,
+  question,
+  { onMeta, onDelta, onDone, onError } = {},
+) {
+  const controller = new AbortController()
+  ;(async () => {
+    let resp
+    try {
+      resp = await fetch('/ask/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_token: sessionToken, question }),
+        signal: controller.signal,
+      })
+    } catch (e) {
+      onError?.('Network error contacting AuditAI.')
+      return
+    }
+    if (!resp.ok || !resp.body) {
+      onError?.(`Server error (${resp.status}).`)
+      return
+    }
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    try {
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let nl
+        while ((nl = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, nl).trim()
+          buffer = buffer.slice(nl + 1)
+          if (!line) continue
+          let event
+          try {
+            event = JSON.parse(line)
+          } catch {
+            continue
+          }
+          if (event.type === 'meta') onMeta?.(event)
+          else if (event.type === 'delta') onDelta?.(event.text || '')
+          else if (event.type === 'done') onDone?.(event)
+          else if (event.type === 'error') onError?.(event.message || 'Stream error.')
+        }
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') onError?.('Stream interrupted.')
+    }
+  })()
+  return controller
+}
+
 // ============================== Admin ==============================
 export const adminLogin = (username, password) =>
   api.post('/admin/login', { username, password })

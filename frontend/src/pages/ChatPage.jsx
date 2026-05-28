@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { askQuestion, startSession } from '../api.js'
+import { askQuestionStream, startSession } from '../api.js'
 import ChatWindow from '../components/chat/ChatWindow.jsx'
 import QuestionInput from '../components/chat/QuestionInput.jsx'
 import SuggestedQuestions from '../components/chat/SuggestedQuestions.jsx'
@@ -11,6 +11,7 @@ export default function ChatPage() {
   const [sessionToken, setSessionToken] = useState(null)
   const [messages, setMessages] = useState([])
   const [isWaiting, setIsWaiting] = useState(false)
+  const streamRef = useRef(null)
 
   // Acquire (or reuse) a session token on mount
   useEffect(() => {
@@ -24,54 +25,72 @@ export default function ChatPage() {
         localStorage.setItem(SESSION_KEY, r.data.session_token)
         setSessionToken(r.data.session_token)
       })
-      .catch(() => {
-        // best-effort — UI will still render
-      })
+      .catch(() => {})
   }, [])
 
+  const updateMessage = (id, patch) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, ...patch } : m)),
+    )
+  }
+
+  const appendDelta = (id, text) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === id ? { ...m, content: (m.content || '') + text } : m,
+      ),
+    )
+  }
+
   const handleSend = async (question) => {
-    if (!sessionToken) return
+    if (!sessionToken || isWaiting) return
+
     const userMsg = {
       id: `u-${Date.now()}`,
       role: 'user',
       content: question,
     }
-    setMessages((prev) => [...prev, userMsg])
+    const aiId = `a-${Date.now()}`
+    const aiMsg = {
+      id: aiId,
+      role: 'assistant',
+      content: '',
+      streaming: true,
+      documentsReferenced: [],
+    }
+    setMessages((prev) => [...prev, userMsg, aiMsg])
     setIsWaiting(true)
 
-    try {
-      const resp = await askQuestion(sessionToken, question)
-      const ai = resp.data
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `a-${ai.history_id}`,
-          role: 'assistant',
-          content: ai.answer,
-          historyId: ai.history_id,
-          documentsReferenced: ai.documents_referenced,
-        },
-      ])
-    } catch (_) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `e-${Date.now()}`,
-          role: 'assistant',
+    streamRef.current = await askQuestionStream(sessionToken, question, {
+      onMeta: (m) => {
+        updateMessage(aiId, { documentsReferenced: m.documents || [] })
+      },
+      onDelta: (t) => appendDelta(aiId, t),
+      onDone: (d) => {
+        updateMessage(aiId, {
+          streaming: false,
+          historyId: d.history_id,
+          documentsReferenced: d.documents || [],
+          wasAnswered: d.was_answered,
+        })
+        setIsWaiting(false)
+      },
+      onError: (err) => {
+        updateMessage(aiId, {
+          streaming: false,
           content:
-            'There was a problem generating a response. Please try again.',
-        },
-      ])
-    } finally {
-      setIsWaiting(false)
-    }
+            (aiMsg.content || '') +
+            `\n\n_There was a problem generating a response. Please try again. (${err})_`,
+        })
+        setIsWaiting(false)
+      },
+    })
   }
 
   const hasMessages = messages.length > 0
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
-      {/* Top bar */}
       <header className="bg-white border-b border-gray-200 px-4 py-3">
         <div className="max-w-3xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -87,7 +106,6 @@ export default function ChatPage() {
         </div>
       </header>
 
-      {/* Body */}
       {hasMessages ? (
         <ChatWindow messages={messages} isWaiting={isWaiting} />
       ) : (
@@ -96,7 +114,6 @@ export default function ChatPage() {
         </div>
       )}
 
-      {/* Input */}
       <QuestionInput onSend={handleSend} disabled={isWaiting || !sessionToken} />
     </div>
   )

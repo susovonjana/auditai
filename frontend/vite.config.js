@@ -20,7 +20,17 @@ export default defineConfig({
           }
         },
       },
-      '/ask': 'http://localhost:8000',
+      '/ask': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        // Streaming responses must not be buffered by the proxy.
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes) => {
+            proxyRes.headers['x-accel-buffering'] = 'no'
+            proxyRes.headers['cache-control'] = 'no-cache'
+          })
+        },
+      },
       '/session': 'http://localhost:8000',
       '/feedback': 'http://localhost:8000',
       '/health': 'http://localhost:8000',

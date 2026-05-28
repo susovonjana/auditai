@@ -1,8 +1,8 @@
 const SUGGESTIONS = [
   'What are the key steps in a financial statement audit?',
-  'What documents are required for a fixed asset audit?',
-  'Explain the difference between internal and external audit',
-  'What is materiality and how is it calculated?',
+  'How to create a Branch in a 1audit',
+  'How to create a client in 1audit',
+  'What is the COA (Chart of Accounts) and how to set it up in 1audit?',
 ]
 
 export default function SuggestedQuestions({ onSelect }) {

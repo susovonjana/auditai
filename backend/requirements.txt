@@ -30,7 +30,9 @@ Pillow==10.2.0
 # LLM (Gemini free tier)
 google-generativeai==0.7.2
 
-# Local embeddings (downloads model on first run, ~80 MB)
+# Local embeddings + reranker (sentence-transformers ships both)
+#   Embedding model:  BAAI/bge-small-en-v1.5 (~133 MB on first run)
+#   Reranker model:   cross-encoder/ms-marco-MiniLM-L-6-v2 (~80 MB)
 sentence-transformers==2.7.0
 torch==2.2.2
 # NumPy must be <2 for PyTorch 2.2 compatibility — do NOT remove this pin
