@@ -35,6 +35,7 @@ from config import (
 from embeddings import embed_query
 from models import DocumentChunk, Document, SearchHistory
 from reranker import rerank
+import smalltalk
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +380,14 @@ async def answer_question(
     question: str,
 ) -> QAResult:
     """Non-streaming end-to-end Q&A. Returns the full QAResult."""
+    # --- Small-talk shortcut: skip retrieval and LLM entirely ---
+    convo_category = smalltalk.detect(question)
+    if convo_category:
+        return QAResult(
+            answer=smalltalk.reply_for(convo_category),
+            was_answered=True,
+        )
+
     question_embedding = await embed_query(question)
     chunks = await retrieve_chunks(db, question, question_embedding, TOP_K_CHUNKS)
     history = await load_recent_history(db, session_id)
@@ -427,6 +436,7 @@ class StreamPreamble:
     chunks: List[RetrievedChunk]
     history: List[SearchHistory]
     was_answered_initial: bool  # based on retrieval quality, before LLM
+    smalltalk_reply: Optional[str] = None  # set if the question was small-talk
 
 
 async def prepare_stream(
@@ -434,6 +444,17 @@ async def prepare_stream(
     session_id: UUID,
     question: str,
 ) -> StreamPreamble:
+    # --- Small-talk shortcut ---
+    convo_category = smalltalk.detect(question)
+    if convo_category:
+        return StreamPreamble(
+            question_embedding=[],
+            chunks=[],
+            history=[],
+            was_answered_initial=True,
+            smalltalk_reply=smalltalk.reply_for(convo_category),
+        )
+
     question_embedding = await embed_query(question)
     chunks = await retrieve_chunks(db, question, question_embedding, TOP_K_CHUNKS)
     history = await load_recent_history(db, session_id)
@@ -474,8 +495,19 @@ async def stream_answer(
     """
     Async generator that yields successive text chunks from the LLM.
 
+    If the question was small-talk, yields the canned reply word-by-word.
     If the knowledge base is empty, yields the EMPTY_KB_TEXT in one chunk.
     """
+    # --- Small-talk shortcut: stream the canned reply, no LLM call ---
+    if preamble.smalltalk_reply:
+        # Split on whitespace but keep the spaces; this feels like real streaming
+        words = preamble.smalltalk_reply.split(" ")
+        for i, w in enumerate(words):
+            chunk = (w + " ") if i < len(words) - 1 else w
+            yield chunk
+            await asyncio.sleep(0.015)  # tiny pacing for a natural feel
+        return
+
     if not preamble.chunks:
         yield EMPTY_KB_TEXT
         return
