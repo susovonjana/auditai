@@ -111,12 +111,64 @@ class QAResult:
 # ---------------------------------------------------------------------------
 # System prompt — two-section answers with grounded vs supplemental content
 # ---------------------------------------------------------------------------
-# Per-language phrasing for the "no answer" / empty-KB fallback so the
-# heuristic that detects unanswered questions still works in both languages.
+# Phrases that strongly indicate "Gemini couldn't / didn't answer".
+# We check ALL of these — Gemini phrases the same idea many ways and we
+# need to catch them all so we can replace with the canonical message.
 NO_ANSWER_MARKERS = {
-    "en": "the knowledge base does not contain",
-    "ar": "لا تحتوي قاعدة المعرفة",
+    "en": [
+        "i'm sorry",
+        "i am sorry",
+        "i apologize",
+        "i apologise",
+        "unable to help",
+        "unable to answer",
+        "unable to provide",
+        "cannot help",
+        "can't help",
+        "cannot answer",
+        "can't answer",
+        "do not have information",
+        "don't have information",
+        "do not have enough information",
+        "don't have enough information",
+        "no information about",
+        "no specific answer",
+        "knowledge base does not contain",
+        "knowledge base doesn't contain",
+        "provided knowledge base does not contain",
+        "not contain information to answer",
+        "not contain a specific answer",
+    ],
+    "ar": [
+        "عذراً",
+        "اعتذر",
+        "أعتذر",
+        "آسف",
+        "اسف",
+        "غير قادر",
+        "لا تحتوي",
+        "ليس لدي",
+        "لا توجد معلومات",
+        "لا أملك معلومات",
+        "لا املك معلومات",
+    ],
 }
+
+
+def looks_like_no_answer(text: str, language: str = "en") -> bool:
+    """True if the response phrasing indicates no answer was produced."""
+    if not text:
+        return True
+    lowered = text.lower()
+    markers = NO_ANSWER_MARKERS.get(language) or NO_ANSWER_MARKERS["en"]
+    if isinstance(markers, str):
+        markers = [markers]
+    return any(m.lower() in lowered for m in markers)
+
+
+# Contact-us footer shown when no answer can be produced
+SUPPORT_EMAIL = "info@1audit.com"
+SUPPORT_PHONE = "+966 920 035 129"
 
 
 def _language_instruction(language: str) -> str:
@@ -131,8 +183,12 @@ def _language_instruction(language: str) -> str:
             "If the source documents are in English, translate the relevant facts into Arabic "
             "for the answer. Numbers and dates remain in their original form. "
             "Follow-up questions must be in Arabic and must end with '؟' (the Arabic question mark). "
-            "If the knowledge base does not contain an answer, write exactly: "
-            "\"لا تحتوي قاعدة المعرفة على إجابة محددة لهذا السؤال.\"\n\n"
+            "If the knowledge base does NOT contain an answer, write EXACTLY this Arabic message "
+            "inside the 'From your knowledge base' section (replace ALL other content) and DO NOT "
+            "produce a Follow-up Questions section at all:\n\n"
+            f"عذراً، أنا غير قادر على مساعدتك في استفسارك.\n\n"
+            f"يمكنك التواصل معنا مباشرة عبر البريد الإلكتروني **{SUPPORT_EMAIL}**\n"
+            f"أو الهاتف: **{SUPPORT_PHONE}**\n\n"
         )
     return (
         "RESPONSE LANGUAGE: English.\n\n"
@@ -150,7 +206,13 @@ Your response MUST use exactly these two sections in this order:
 - Use **bold** for key terms, standard names (e.g., **ISA 315**), thresholds, and important figures.
 - Reference source documents naturally: "According to ISA 315..." or "As stated in the uploaded compliance guidelines...".
 - Keep paragraphs short — 2-3 sentences each.
-- If the provided context does not contain a useful answer, write exactly: "The knowledge base does not contain a specific answer to this question."
+- If the provided context does NOT contain a useful answer, write EXACTLY this (replace all other content in this section, do NOT add a Follow-up Questions section):
+
+    I'm sorry. I'm unable to help you with your query.
+
+    Feel free to email us directly at **info@1audit.com**
+
+    Or call us at **+966 920 035 129**
 
 ## Follow-up Questions
 Generate EXACTLY three short follow-up questions the user is likely to ask next, given the topic and what is available in the knowledge base context. Output them as a plain bullet list with `-`, one question per line, no extra commentary. Each question must:
@@ -478,22 +540,16 @@ def _build_user_prompt(
 # ---------------------------------------------------------------------------
 EMPTY_KB_TEXT = (
     "## From your knowledge base\n"
-    "The knowledge base does not contain a specific answer to this question. "
-    "Please ask your administrator to upload the relevant documentation.\n\n"
-    "## Follow-up Questions\n"
-    "- What documents are currently in the knowledge base?\n"
-    "- How do I upload audit standards or firm policies?\n"
-    "- What types of audit questions can AuditAI answer?"
+    "I'm sorry. I'm unable to help you with your query.\n\n"
+    f"Feel free to email us directly at **{SUPPORT_EMAIL}**\n\n"
+    f"Or call us at **{SUPPORT_PHONE}**"
 )
 
 _EMPTY_KB_TEXT_AR = (
     "## From your knowledge base\n"
-    "لا تحتوي قاعدة المعرفة على إجابة محددة لهذا السؤال. "
-    "يرجى أن تطلب من المسؤول رفع المستندات ذات الصلة.\n\n"
-    "## Follow-up Questions\n"
-    "- ما هي المستندات المتوفرة حالياً في قاعدة المعرفة؟\n"
-    "- كيف يمكنني رفع معايير التدقيق أو سياسات الشركة؟\n"
-    "- ما هي أنواع أسئلة التدقيق التي يستطيع AuditAI الإجابة عليها؟"
+    "عذراً، أنا غير قادر على مساعدتك في استفسارك.\n\n"
+    f"يمكنك التواصل معنا مباشرة عبر البريد الإلكتروني **{SUPPORT_EMAIL}**\n\n"
+    f"أو الهاتف: **{SUPPORT_PHONE}**"
 )
 
 
@@ -576,8 +632,14 @@ async def answer_question(
 
     # Strip any inline source citations the model may have produced.
     answer_text = strip_inline_citations(answer_text)
-    marker = NO_ANSWER_MARKERS.get(language, NO_ANSWER_MARKERS["en"])
-    was_answered = kb_has_signal and marker not in answer_text.lower()
+
+    # Detect no-answer phrasings and FORCE the canonical contact-us message.
+    # This guarantees the user always sees the same polished message.
+    if looks_like_no_answer(answer_text, language) or not kb_has_signal:
+        answer_text = _empty_kb_text(language)
+        was_answered = False
+    else:
+        was_answered = True
 
     result = QAResult(
         answer=answer_text,
@@ -754,12 +816,17 @@ async def stream_answer(
 
     asyncio.create_task(asyncio.to_thread(producer))
 
-    # Streaming citation filter:
-    # We can't apply the regex blindly to each piece because a citation
-    # like "[Source 6, Page 135]" may be split across chunk boundaries.
-    # Strategy: keep an unflushed tail (up to 200 chars). When we see a
-    # "]" or ")" we know any pending bracket is closed and we can clean
-    # the buffer and flush most of it, retaining a small lookbehind.
+    # ---- Probe-and-decide buffer ----
+    # Buffer the first ~200 chars from Gemini BEFORE yielding anything,
+    # so we can detect "I'm sorry, I can't help" responses and swap them
+    # for the canonical contact-us message — without the user briefly
+    # seeing the wrong text. Adds ~200-400 ms of initial delay only.
+    PROBE_CHARS = 200
+    probe = []
+    probe_len = 0
+    decided = False
+
+    # Streaming citation filter buffer (after we've decided)
     buf = ""
     LOOKBEHIND = 200
 
@@ -767,21 +834,45 @@ async def stream_answer(
         piece = await queue.get()
         if piece is None:
             break
-        buf += piece
 
-        # Only attempt clean+flush when we have a complete bracket or enough text
+        if not decided:
+            probe.append(piece)
+            probe_len += len(piece)
+            if probe_len < PROBE_CHARS:
+                continue
+            # We have enough — decide
+            decided = True
+            combined = "".join(probe)
+            if looks_like_no_answer(combined, preamble.language):
+                # Replace with canonical, drain producer, stop.
+                yield _empty_kb_text(preamble.language)
+                while True:
+                    p = await queue.get()
+                    if p is None:
+                        break
+                return
+            # Not no-answer — flush probe into the citation filter
+            buf = combined
+            continue
+
+        buf += piece
         if "]" in piece or ")" in piece or len(buf) > LOOKBEHIND * 4:
             cleaned = strip_inline_citations(buf)
-            # Keep a trailing window in the buffer in case a citation
-            # starts there but isn't complete yet.
             if len(cleaned) > LOOKBEHIND:
                 emit = cleaned[:-LOOKBEHIND]
                 buf = cleaned[-LOOKBEHIND:]
                 if emit:
                     yield emit
             else:
-                # Not enough cleaned text yet — keep buffering
                 buf = cleaned
+
+    # Stream ended before we decided (very short response)
+    if not decided:
+        combined = "".join(probe)
+        if looks_like_no_answer(combined, preamble.language):
+            yield _empty_kb_text(preamble.language)
+            return
+        buf = combined
 
     # Final flush: scrub any remaining tail
     final = strip_inline_citations(buf)

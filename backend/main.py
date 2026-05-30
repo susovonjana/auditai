@@ -103,11 +103,16 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # --- CORS ---
+# FRONTEND_ORIGIN can be comma-separated for multi-origin (e.g. standalone
+# AuditAI UI + the embedded widget inside 1audit).
+_extra_origins = [o.strip() for o in (FRONTEND_ORIGIN or "").split(",") if o.strip()]
 allowed_origins = [
-    FRONTEND_ORIGIN,
-    "http://localhost:5173",
+    *_extra_origins,
+    "http://localhost:5173",       # standalone AuditAI dev
     "http://127.0.0.1:5173",
     "http://localhost:3000",
+    "http://localhost:3002",       # 1audit dev port
+    "http://127.0.0.1:3002",
 ]
 app.add_middleware(
     CORSMiddleware,

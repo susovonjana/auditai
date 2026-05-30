@@ -258,8 +258,8 @@ async def ask_stream(
 
         full_answer = "".join(accumulated).strip() or qa.EMPTY_KB_TEXT
         elapsed_ms = int((time.perf_counter() - started) * 1000)
-        was_answered = preamble.was_answered_initial and (
-            "knowledge base does not contain" not in full_answer.lower()
+        was_answered = preamble.was_answered_initial and not qa.looks_like_no_answer(
+            full_answer, preamble.language,
         )
 
         # Cache positive answers for ~1 hour so repeats are instant.

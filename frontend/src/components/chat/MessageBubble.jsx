@@ -4,6 +4,62 @@ import remarkGfm from 'remark-gfm'
 import { sendFeedback } from '../../api.js'
 import { getLanguage, t } from '../../i18n.js'
 
+const NO_ANSWER_PATTERNS = [
+  "i'm sorry. i'm unable to help",
+  'unable to help you with your query',
+  'عذراً، أنا غير قادر',
+  'غير قادر على مساعدتك',
+]
+const isNoAnswer = (content) => {
+  if (!content) return false
+  const c = content.toLowerCase()
+  return NO_ANSWER_PATTERNS.some((p) => c.includes(p.toLowerCase()))
+}
+
+const MailIcon = () => (
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 shrink-0">
+    <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path>
+    <polyline points="22,6 12,13 2,6"></polyline>
+  </svg>
+)
+const PhoneIcon = () => (
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 shrink-0">
+    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+  </svg>
+)
+
+function NoAnswerCard() {
+  return (
+    <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5">
+      <div className="flex items-start gap-2 mb-3">
+        <span className="text-amber-600 mt-0.5">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5 shrink-0">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="8" x2="12" y2="12"></line>
+            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+          </svg>
+        </span>
+        <div className="text-sm font-medium text-gray-800 leading-snug">
+          I'm sorry, I couldn't find an answer to your query in the knowledge base.
+        </div>
+      </div>
+      <div className="text-xs text-gray-600 mb-2.5">
+        Our support team is happy to help you directly:
+      </div>
+      <div className="flex flex-col gap-1.5">
+        <a href="mailto:info@1audit.com" className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white border border-amber-200 hover:border-amber-400 hover:bg-amber-100 transition text-sm text-gray-800 no-underline">
+          <span className="text-amber-600"><MailIcon /></span>
+          <span className="font-medium">info@1audit.com</span>
+        </a>
+        <a href="tel:+966920035129" className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white border border-amber-200 hover:border-amber-400 hover:bg-amber-100 transition text-sm text-gray-800 no-underline">
+          <span className="text-amber-600"><PhoneIcon /></span>
+          <span className="font-medium" dir="ltr">+966 920 035 129</span>
+        </a>
+      </div>
+    </div>
+  )
+}
+
 // Split the AI response into its labelled sections so we can style each
 // one distinctly. Recognises the current schema (KB + Follow-ups) AND
 // legacy schemas (with Additional context / Key Takeaway) so older
@@ -88,6 +144,7 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
   const [lang, setLang] = useState(getLanguage())
   const isUser = message.role === 'user'
   const sections = useMemo(() => splitSections(message.content), [message.content])
+  const noAnswer = useMemo(() => isNoAnswer(message.content), [message.content])
 
   useEffect(() => {
     const h = (e) => setLang(e.detail)
@@ -121,7 +178,9 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
   return (
     <div className="flex justify-start my-3">
       <div className="bg-white border border-gray-200 px-5 py-4 rounded-2xl rounded-tl-sm max-w-[88%] shadow-sm w-full">
-        {sections ? (
+        {noAnswer ? (
+          <NoAnswerCard />
+        ) : sections ? (
           <>
             {sections.kb && (
               <Section
