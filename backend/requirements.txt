@@ -19,6 +19,9 @@ pgvector==0.2.5
 bcrypt==4.1.2
 PyJWT==2.8.0
 python-dotenv==1.0.1
+slowapi==0.1.9              # per-IP rate limiting on FastAPI
+filetype==1.2.0             # pure-Python magic-byte validation
+cryptography==42.0.5        # AES-256-GCM file encryption at rest
 
 # File Parsing
 PyMuPDF==1.23.26        # legacy fallback; main PDF lib is pdfplumber

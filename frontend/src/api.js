@@ -45,7 +45,7 @@ export const getSessionHistory = (token) =>
  *   onMeta({documents, chunks_found})
  *   onDelta(textPiece)
  *   onDone({history_id, was_answered, response_time_ms, documents})
- *   onError(message)
+ *   onError(message)  — also fires for 429 rate limit + 413 too long
  *
  * Returns an AbortController so callers can cancel mid-stream.
  */
@@ -69,7 +69,25 @@ export async function askQuestionStream(
       return
     }
     if (!resp.ok || !resp.body) {
-      onError?.(`Server error (${resp.status}).`)
+      // Try to surface the server-side reason cleanly
+      let detail = `Server error (${resp.status}).`
+      try {
+        const j = await resp.json()
+        if (j?.detail) detail = j.detail
+        else if (j?.error) detail = j.error
+      } catch {}
+      if (resp.status === 429) {
+        detail =
+          detail ||
+          'Too many requests. Please slow down and try again in a moment.'
+      } else if (resp.status === 413) {
+        detail = detail || 'Your question is too long. Please shorten it.'
+      } else if (resp.status === 503 || resp.status === 502) {
+        detail =
+          detail ||
+          'AuditAI is having trouble reaching the AI service. Please try again.'
+      }
+      onError?.(detail)
       return
     }
     const reader = resp.body.getReader()

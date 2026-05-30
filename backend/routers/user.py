@@ -8,22 +8,32 @@ Endpoints:
   POST /feedback                 submit thumbs up / down
   GET  /session/{token}/history  this session's Q&A history
   GET  /health                   server health probe
-"""
-from __future__ import annotations
 
+NOTE: No `from __future__ import annotations` — slowapi's decorator
+interferes with FastAPI's resolution of stringified forward references.
+"""
 import json
 import logging
 import time
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import (
+    MAX_QUESTION_CHARS,
+    MAX_QUESTIONS_PER_SESSION_DAY,
+    RATE_LIMIT_ASK,
+    RATE_LIMIT_SESSION_START,
+)
 from database import AsyncSessionLocal, get_db
 from models import SearchHistory, UserSession
+from rate_limit import limiter
 import qa
 import schemas
 
@@ -47,6 +57,7 @@ async def health():
 # Session start
 # ---------------------------------------------------------------------------
 @router.post("/session/start", response_model=schemas.SessionStartResponse)
+@limiter.limit(RATE_LIMIT_SESSION_START)
 async def start_session(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -82,15 +93,58 @@ async def _load_session(db: AsyncSession, token: str) -> UserSession:
     return session
 
 
+async def _check_session_quota(db: AsyncSession, session_id) -> None:
+    """
+    Enforce a per-session 24-hour cap on /ask calls.
+
+    Per-IP rate limits protect against single attackers; per-session caps
+    protect against token-theft attacks where a real user's token is reused
+    from many IPs.
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    count = (
+        await db.execute(
+            select(func.count(SearchHistory.id)).where(
+                SearchHistory.session_id == session_id,
+                SearchHistory.asked_at >= since,
+            )
+        )
+    ).scalar() or 0
+    if count >= MAX_QUESTIONS_PER_SESSION_DAY:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"This session has reached its daily limit of "
+                f"{MAX_QUESTIONS_PER_SESSION_DAY} questions. "
+                "Please try again in 24 hours."
+            ),
+        )
+
+
+def _validate_question_payload(question: str) -> None:
+    """Defence-in-depth checks before paying for any compute."""
+    if not question or not question.strip():
+        raise HTTPException(status_code=400, detail="Empty question.")
+    if len(question) > MAX_QUESTION_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Question too long (max {MAX_QUESTION_CHARS} characters).",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Ask (non-streaming) — kept for compatibility
 # ---------------------------------------------------------------------------
 @router.post("/ask", response_model=schemas.AskResponse)
+@limiter.limit(RATE_LIMIT_ASK)
 async def ask(
+    request: Request,
     payload: schemas.AskRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    _validate_question_payload(payload.question)
     session = await _load_session(db, payload.session_token)
+    await _check_session_quota(db, session.id)
 
     started = time.perf_counter()
     try:
@@ -151,11 +205,15 @@ async def ask(
 #    "response_time_ms": 1234}
 # ---------------------------------------------------------------------------
 @router.post("/ask/stream")
+@limiter.limit(RATE_LIMIT_ASK)
 async def ask_stream(
+    request: Request,
     payload: schemas.AskRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    _validate_question_payload(payload.question)
     session = await _load_session(db, payload.session_token)
+    await _check_session_quota(db, session.id)
 
     started = time.perf_counter()
     try:

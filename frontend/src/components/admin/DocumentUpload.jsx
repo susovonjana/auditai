@@ -67,7 +67,7 @@ export default function DocumentUpload({ onUploaded }) {
       <div className="bg-white border border-gray-200 rounded-xl p-6">
         <h2 className="text-lg font-semibold text-gray-900 mb-1">Upload documents</h2>
         <p className="text-sm text-gray-500 mb-4">
-          PDF, Excel (.xlsx, .xls), and images (.png, .jpg, .jpeg). Multiple files supported.
+          PDF, Word (.doc, .docx), Excel (.xlsx, .xls), and images (.png, .jpg, .jpeg). Multiple files supported.
         </p>
 
         <div className="flex flex-col sm:flex-row sm:items-end gap-3 mb-4">

@@ -12,11 +12,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from auth import hash_password
 from config import ADMIN_PASSWORD, ADMIN_USERNAME, FRONTEND_ORIGIN
 from database import AsyncSessionLocal, init_db
 from models import AdminUser
+from rate_limit import limiter
 from routers import admin as admin_router
 from routers import user as user_router
 
@@ -72,6 +76,11 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# --- Rate limiting (slowapi) ---
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # --- CORS ---
 allowed_origins = [

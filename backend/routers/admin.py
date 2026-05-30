@@ -1,9 +1,13 @@
 """
 Admin router — all /admin/* endpoints.
 All routes (except /admin/login) require a valid JWT token.
-"""
-from __future__ import annotations
 
+NOTE: We deliberately do NOT use `from __future__ import annotations` here
+because slowapi's `@limiter.limit(...)` decorator wraps endpoint functions,
+and FastAPI's dependency analyzer cannot resolve stringified forward
+references (like `schemas.AdminLoginRequest`) once the function lives in
+the decorator's wrapping module scope.
+"""
 import csv
 import io
 import logging
@@ -22,6 +26,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     status,
 )
@@ -39,8 +44,18 @@ from config import (
     ALLOWED_EXTENSIONS,
     JWT_EXPIRE_HOURS,
     MAX_FILE_SIZE_BYTES,
+    RATE_LIMIT_ADMIN_LOGIN,
+    RATE_LIMIT_ADMIN_UPLOAD,
     UPLOAD_DIR,
 )
+from file_crypto import (
+    encrypt_and_write,
+    is_encryption_enabled,
+    open_decrypted,
+    remove_encrypted,
+)
+from file_validation import FileValidationError, validate_file
+from rate_limit import limiter
 from database import get_db
 from embeddings import embed_texts
 from models import (
@@ -65,7 +80,9 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # Auth
 # ===========================================================================
 @router.post("/login", response_model=schemas.AdminLoginResponse)
+@limiter.limit(RATE_LIMIT_ADMIN_LOGIN)
 async def admin_login(
+    request: Request,
     payload: schemas.AdminLoginRequest,
     db: AsyncSession = Depends(get_db),
 ):
@@ -154,64 +171,92 @@ async def kb_status(
 # Document upload
 # ===========================================================================
 @router.post("/upload", response_model=schemas.DocumentUploadResponse)
+@limiter.limit(RATE_LIMIT_ADMIN_UPLOAD)
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     category: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
     admin: AdminUser = Depends(get_current_admin),
 ):
     """
-    Upload a single document. The full ingest pipeline runs synchronously:
-      validate → save to disk → extract text → chunk → embed → store
+    Upload a single document. Pipeline:
+      validate extension → buffer to memory → enforce size cap →
+      magic-byte validation → encrypt and write to disk →
+      extract text → chunk → embed → store
     """
     filename = file.filename or "uploaded"
+    # Sanitize: strip any path traversal from the user-supplied filename
+    filename = Path(filename).name
     ext = Path(filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="This file type is not supported. Please upload PDF, Excel, or image files.",
+            detail="This file type is not supported. Please upload PDF, Word, Excel, or image files.",
         )
 
-    # Stream to disk under a UUID to avoid name collisions
+    # Read into memory up to the size cap so we can magic-byte validate
+    # AND encrypt before touching disk. For >25 MB we'd want streaming
+    # encryption, but the cap protects us here.
+    body = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        body.extend(chunk)
+        if len(body) > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="This file exceeds the maximum allowed size. Please split it into smaller files.",
+            )
+    if not body:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    # Write to a temp path so file_validation can read magic bytes.
     doc_id = uuid.uuid4()
     stored_name = f"{doc_id}{ext}"
-    target_path: Path = UPLOAD_DIR / stored_name
+    plain_target: Path = UPLOAD_DIR / stored_name
+    plain_target.write_bytes(bytes(body))
 
-    bytes_written = 0
-    with target_path.open("wb") as dst:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            bytes_written += len(chunk)
-            if bytes_written > MAX_FILE_SIZE_BYTES:
-                dst.close()
-                target_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail="This file exceeds the maximum allowed size. Please split it into smaller files.",
-                )
-            dst.write(chunk)
+    # Magic-byte validation — rejects renamed files
+    try:
+        validate_file(plain_target, ext)
+    except FileValidationError as exc:
+        plain_target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    # Create the document row in "processing" state
+    # Now encrypt: write the encrypted version, then remove the plaintext.
+    try:
+        encrypted_target = encrypt_and_write(bytes(body), plain_target)
+    except Exception as exc:
+        plain_target.unlink(missing_ok=True)
+        logger.exception("File encryption failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to securely store the file.")
+
+    # If encryption is on, the plaintext we wrote for validation is no
+    # longer needed — wipe it.
+    if encrypted_target != plain_target:
+        plain_target.unlink(missing_ok=True)
+
     document = Document(
         id=doc_id,
         filename=filename,
         file_type=ext.lstrip("."),
         category=category,
-        file_path=str(target_path),
+        file_path=str(encrypted_target),
         status="processing",
         total_chunks=0,
-        file_size_bytes=bytes_written,
+        file_size_bytes=len(body),
         uploaded_by=admin.username,
     )
     db.add(document)
     await db.commit()
     await db.refresh(document)
 
-    # Extract structured blocks (text + tables + page numbers)
+    # Extract structured blocks. Decrypt to a temp file for the parser.
     try:
-        blocks, file_type_label = extract_blocks(target_path)
+        with open_decrypted(encrypted_target) as work_path:
+            blocks, file_type_label = extract_blocks(work_path)
     except UnsupportedFileTypeError as exc:
         document.status = "error"
         await db.commit()
@@ -317,9 +362,9 @@ async def delete_document(
     if not document:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    # Remove file from disk (best effort)
+    # Remove file from disk (encrypted or plain), best effort
     try:
-        Path(document.file_path).unlink(missing_ok=True)
+        remove_encrypted(document.file_path)
     except Exception:  # pragma: no cover
         logger.warning("Failed to delete file on disk for %s", document_id)
 

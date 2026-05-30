@@ -81,3 +81,24 @@ CONVERSATION_MEMORY_TURNS: int = 5
 
 # --- Allowed file extensions ---
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg"}
+
+# --- Security: rate limits ---
+# slowapi limit strings, see https://limits.readthedocs.io/en/stable/quickstart.html
+RATE_LIMIT_ASK: str = os.getenv("RATE_LIMIT_ASK", "30/hour;200/day")
+RATE_LIMIT_SESSION_START: str = os.getenv("RATE_LIMIT_SESSION_START", "10/minute")
+RATE_LIMIT_ADMIN_LOGIN: str = os.getenv("RATE_LIMIT_ADMIN_LOGIN", "5/minute;30/hour")
+RATE_LIMIT_ADMIN_UPLOAD: str = os.getenv("RATE_LIMIT_ADMIN_UPLOAD", "20/hour")
+
+# Per-session hard cap (cheaper than per-IP — applies even if same IP rotates tokens)
+MAX_QUESTIONS_PER_SESSION_DAY: int = int(
+    os.getenv("MAX_QUESTIONS_PER_SESSION_DAY", "100")
+)
+
+# --- Security: file encryption at rest ---
+# 32 random URL-safe base64 chars. Generated with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+FILE_ENCRYPTION_KEY: str = os.getenv("FILE_ENCRYPTION_KEY", "")
+ENCRYPT_UPLOADS: bool = os.getenv("ENCRYPT_UPLOADS", "true").lower() == "true"
+
+# --- Security: max question / answer payload sizes (defence-in-depth) ---
+MAX_QUESTION_CHARS: int = int(os.getenv("MAX_QUESTION_CHARS", "4000"))
