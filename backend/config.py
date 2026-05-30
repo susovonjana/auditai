@@ -68,7 +68,7 @@ USE_RERANKER: bool = os.getenv("USE_RERANKER", "true").lower() == "true"
 
 # --- Chunking ---
 CHUNK_SIZE: int = 1000
-CHUNK_OVERLAP: int = 250  # bigger overlap reduces "number split from label" cases
+CHUNK_OVERLAP: int = 100  # bigger overlap reduces "number split from label" cases
 
 # --- Retrieval ---
 # Hybrid: pull more candidates from each retriever, then rerank down to TOP_K.

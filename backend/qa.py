@@ -34,6 +34,7 @@ from config import (
     CONVERSATION_MEMORY_TURNS,
     USE_RERANKER,
 )
+from cache import answer_cache
 from embeddings import embed_query
 from models import DocumentChunk, Document, SearchHistory
 from reranker import rerank
@@ -365,19 +366,29 @@ async def _rerank_chunks(
 # ---------------------------------------------------------------------------
 # Hybrid retrieval entry point
 # ---------------------------------------------------------------------------
+async def _safe_fts_search(
+    db: AsyncSession, question: str, limit: int
+) -> List[RetrievedChunk]:
+    """Wrapper that swallows errors so asyncio.gather can run alongside vector."""
+    try:
+        return await _fts_search(db, question, limit)
+    except Exception as exc:
+        logger.warning("FTS search failed (%s) — using vector results only.", exc)
+        return []
+
+
 async def retrieve_chunks(
     db: AsyncSession,
     question: str,
     question_embedding: List[float],
     top_k: int = TOP_K_CHUNKS,
 ) -> List[RetrievedChunk]:
-    vector_hits = await _vector_search(db, question_embedding, INITIAL_CANDIDATES)
-    try:
-        fts_hits = await _fts_search(db, question, INITIAL_CANDIDATES)
-    except Exception as exc:
-        # If the FTS index is missing or query is unusual, fall back gracefully.
-        logger.warning("FTS search failed (%s) — using vector results only.", exc)
-        fts_hits = []
+    # Run vector + FTS in parallel — they're independent and similar speed,
+    # so this saves ~80-100 ms per question.
+    vector_hits, fts_hits = await asyncio.gather(
+        _vector_search(db, question_embedding, INITIAL_CANDIDATES),
+        _safe_fts_search(db, question, INITIAL_CANDIDATES),
+    )
 
     fused = _reciprocal_rank_fusion([vector_hits, fts_hits])
     if not fused:
@@ -525,6 +536,19 @@ async def answer_question(
             was_answered=True,
         )
 
+    # --- Cache shortcut: same question + same language asked recently? ---
+    cached = answer_cache.get(question, language)
+    if cached is not None:
+        logger.info("Cache hit for question (lang=%s).", language)
+        return QAResult(
+            answer=cached["answer"],
+            was_answered=cached["was_answered"],
+            chunks_used=cached.get("chunks_used", []),
+            documents_referenced=cached.get("documents_referenced", []),
+            document_filenames=cached.get("document_filenames", []),
+            similarity_scores=cached.get("similarity_scores", []),
+        )
+
     question_embedding = await embed_query(question)
     chunks = await retrieve_chunks(db, question, question_embedding, TOP_K_CHUNKS)
     history = await load_recent_history(db, session_id)
@@ -555,7 +579,7 @@ async def answer_question(
     marker = NO_ANSWER_MARKERS.get(language, NO_ANSWER_MARKERS["en"])
     was_answered = kb_has_signal and marker not in answer_text.lower()
 
-    return QAResult(
+    result = QAResult(
         answer=answer_text,
         was_answered=was_answered,
         chunks_used=[str(c.chunk_id) for c in chunks],
@@ -564,6 +588,23 @@ async def answer_question(
         similarity_scores=[round(c.similarity, 4) for c in chunks],
         question_embedding=question_embedding,
     )
+
+    # Only cache positive answers — we want unanswered questions to
+    # re-try in case the admin has added documents in the meantime.
+    if was_answered:
+        answer_cache.set(
+            question,
+            language,
+            {
+                "answer": result.answer,
+                "was_answered": result.was_answered,
+                "chunks_used": result.chunks_used,
+                "documents_referenced": result.documents_referenced,
+                "document_filenames": result.document_filenames,
+                "similarity_scores": result.similarity_scores,
+            },
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +619,12 @@ class StreamPreamble:
     was_answered_initial: bool  # based on retrieval quality, before LLM
     smalltalk_reply: Optional[str] = None  # set if the question was small-talk
     language: str = "en"
+    cached_reply: Optional[str] = None     # set if we have a cached answer
+    cached_documents: List[str] = field(default_factory=list)
+    cached_doc_ids: List[str] = field(default_factory=list)
+    cached_chunks_used: List[str] = field(default_factory=list)
+    cached_similarity: List[float] = field(default_factory=list)
+    question: str = ""
 
 
 async def prepare_stream(
@@ -596,6 +643,25 @@ async def prepare_stream(
             was_answered_initial=True,
             smalltalk_reply=smalltalk.reply_for(convo_category, language=language),
             language=language,
+            question=question,
+        )
+
+    # --- Cache shortcut: same question + same language asked recently? ---
+    cached = answer_cache.get(question, language)
+    if cached is not None:
+        logger.info("Cache hit for streamed question (lang=%s).", language)
+        return StreamPreamble(
+            question_embedding=[],
+            chunks=[],
+            history=[],
+            was_answered_initial=cached.get("was_answered", True),
+            language=language,
+            cached_reply=cached["answer"],
+            cached_documents=cached.get("document_filenames", []),
+            cached_doc_ids=cached.get("documents_referenced", []),
+            cached_chunks_used=cached.get("chunks_used", []),
+            cached_similarity=cached.get("similarity_scores", []),
+            question=question,
         )
 
     question_embedding = await embed_query(question)
@@ -608,6 +674,7 @@ async def prepare_stream(
         history=history,
         was_answered_initial=top_similarity >= SIMILARITY_THRESHOLD,
         language=language,
+        question=question,
     )
 
 
@@ -650,6 +717,17 @@ async def stream_answer(
             chunk = (w + " ") if i < len(words) - 1 else w
             yield chunk
             await asyncio.sleep(0.015)
+        return
+
+    # --- Cache hit: stream the cached answer back, no Gemini call ---
+    if preamble.cached_reply:
+        # Emit in ~80-char chunks so the UI updates smoothly without
+        # making the cached response feel artificially slow.
+        text = preamble.cached_reply
+        CHUNK_SIZE = 80
+        for i in range(0, len(text), CHUNK_SIZE):
+            yield text[i : i + CHUNK_SIZE]
+            await asyncio.sleep(0.005)
         return
 
     if not preamble.chunks:

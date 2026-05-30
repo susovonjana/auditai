@@ -31,6 +31,7 @@ from config import (
     RATE_LIMIT_ASK,
     RATE_LIMIT_SESSION_START,
 )
+from cache import answer_cache
 from database import AsyncSessionLocal, get_db
 from models import SearchHistory, UserSession
 from rate_limit import limiter
@@ -260,6 +261,32 @@ async def ask_stream(
         was_answered = preamble.was_answered_initial and (
             "knowledge base does not contain" not in full_answer.lower()
         )
+
+        # Cache positive answers for ~1 hour so repeats are instant.
+        # Skip if this WAS a cache hit (cached_reply set) — already in cache.
+        # Skip small-talk — they're already instant.
+        if (
+            was_answered
+            and not preamble.smalltalk_reply
+            and not preamble.cached_reply
+            and full_answer
+        ):
+            answer_cache.set(
+                preamble.question or question,
+                preamble.language,
+                {
+                    "answer": full_answer,
+                    "was_answered": was_answered,
+                    "chunks_used": [str(c.chunk_id) for c in preamble.chunks],
+                    "documents_referenced": list(
+                        {str(c.document_id) for c in preamble.chunks}
+                    ),
+                    "document_filenames": document_filenames,
+                    "similarity_scores": [
+                        round(c.similarity, 4) for c in preamble.chunks
+                    ],
+                },
+            )
 
         # Persist to search_history in a fresh session — the original `db`
         # session is bound to the HTTP request and may be closing.

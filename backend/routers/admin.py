@@ -39,6 +39,7 @@ from auth import (
     get_current_admin,
     verify_password,
 )
+from cache import answer_cache
 from chunker import chunk_blocks
 from config import (
     ALLOWED_EXTENSIONS,
@@ -312,6 +313,9 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
+    # The knowledge base just changed — old cached answers may be stale.
+    answer_cache.clear()
+
     return schemas.DocumentUploadResponse(
         id=document.id,
         filename=document.filename,
@@ -371,6 +375,10 @@ async def delete_document(
     # Cascade removes chunks
     await db.delete(document)
     await db.commit()
+
+    # The knowledge base just changed — old cached answers may be stale.
+    answer_cache.clear()
+
     return schemas.Message(message="Document, chunks, and embeddings removed.")
 
 

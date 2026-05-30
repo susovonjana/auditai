@@ -57,13 +57,33 @@ async def _seed_initial_admin() -> None:
         logger.info("Seeded initial admin user '%s'.", ADMIN_USERNAME)
 
 
+async def _warm_up_models() -> None:
+    """
+    Pre-load the embedding model and reranker so the first user request
+    doesn't pay the 10-second cold-start cost.
+    """
+    try:
+        from embeddings import embed_query
+        from reranker import rerank
+
+        logger.info("Warming up embedding model...")
+        await embed_query("warmup")
+        logger.info("Warming up reranker model...")
+        await rerank("warmup", ["sample passage one", "sample passage two"])
+        logger.info("Models warm and ready.")
+    except Exception as exc:
+        # Don't block startup — first request will pay the cold-start cost.
+        logger.warning("Model warm-up failed (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: init DB + seed admin. Shutdown: nothing special needed."""
+    """Startup: init DB + seed admin + warm up models. Shutdown: nothing special."""
     logger.info("AuditAI starting up...")
     try:
         await init_db()
         await _seed_initial_admin()
+        await _warm_up_models()
     except Exception as exc:  # pragma: no cover
         logger.exception("Startup error: %s", exc)
     yield
