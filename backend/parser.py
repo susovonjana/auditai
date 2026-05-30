@@ -15,11 +15,75 @@ Routing (all free libraries):
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tesseract auto-discovery (Windows + macOS + Linux)
+# ---------------------------------------------------------------------------
+# pytesseract calls `tesseract` from PATH. On Windows the official installer
+# does NOT add itself to PATH, so we look in the most common install
+# locations and fall back to a user-set TESSERACT_CMD env var.
+_TESSERACT_CONFIGURED = False
+
+
+def _configure_tesseract() -> Optional[str]:
+    """
+    Try to locate tesseract.exe / tesseract and tell pytesseract where it is.
+    Runs once per process. Returns the resolved path, or None if not found.
+    """
+    global _TESSERACT_CONFIGURED
+    if _TESSERACT_CONFIGURED:
+        return None
+
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+
+    # 1. Explicit env var wins
+    env_path = os.getenv("TESSERACT_CMD")
+    candidates = []
+    if env_path:
+        candidates.append(env_path)
+
+    # 2. Already on PATH?
+    on_path = shutil.which("tesseract")
+    if on_path:
+        candidates.append(on_path)
+
+    # 3. Common Windows install paths
+    candidates.extend([
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        # macOS Homebrew
+        "/opt/homebrew/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        # Linux
+        "/usr/bin/tesseract",
+    ])
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            logger.info("Tesseract found at: %s", path)
+            _TESSERACT_CONFIGURED = True
+            return path
+
+    logger.warning(
+        "Tesseract not found. Image OCR will fail until you install it. "
+        "Windows: https://github.com/UB-Mannheim/tesseract/wiki  "
+        "Then add the install folder to PATH or set TESSERACT_CMD in .env."
+    )
+    _TESSERACT_CONFIGURED = True  # don't re-warn every call
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +321,8 @@ def _ocr_pdf(path: Path) -> List[ParsedBlock]:
         logger.error("OCR fallback requires pdf2image + pytesseract (and poppler).")
         return []
 
+    _configure_tesseract()
+
     try:
         images = convert_from_path(str(path), dpi=200)
     except Exception as exc:
@@ -420,11 +486,21 @@ def _extract_image(path: Path) -> List[ParsedBlock]:
     except Exception as exc:
         logger.debug("img2table not available or failed (%s) — skipping table detection.", exc)
 
+    # Make sure tesseract.exe is configured before we try to use it
+    _configure_tesseract()
+
     # OCR the full image as text (always — tables above are bonus context)
     try:
         with Image.open(str(path)) as img:
             prep = _preprocess_image_for_ocr(img)
             text = (pytesseract.image_to_string(prep) or "").strip()
+    except pytesseract.TesseractNotFoundError as exc:
+        logger.error("Tesseract not installed: %s", exc)
+        raise TextExtractionError(
+            "Image OCR requires Tesseract, which is not installed on this server. "
+            "Install Tesseract OCR (Windows: https://github.com/UB-Mannheim/tesseract/wiki) "
+            "and add it to PATH, then retry the upload."
+        )
     except Exception as exc:
         logger.error("OCR failed for %s: %s", path, exc)
         text = ""

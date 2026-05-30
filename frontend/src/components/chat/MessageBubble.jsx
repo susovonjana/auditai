@@ -118,7 +118,7 @@ function FollowUps({ questions, onSelect, disabled, title }) {
     <div className="mt-3 rounded-xl border bg-indigo-50 border-indigo-100 px-4 py-3">
       <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide mb-2 text-indigo-700">
         <span>💬</span>
-        <span>{title || 'Suggested follow-up questions'}</span>
+        <span>{title || 'Explore Related Topics'}</span>
       </div>
       <div className="flex flex-col gap-2">
         {questions.map((q, i) => (
