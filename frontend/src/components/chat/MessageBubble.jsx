@@ -3,25 +3,40 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { sendFeedback } from '../../api.js'
 
-// Split the AI response into its three labelled sections so we can style
-// each one distinctly. Falls back to a single block if the model didn't
-// emit the expected headings.
+// Split the AI response into its labelled sections so we can style each
+// one distinctly. Recognises the current schema (KB + Follow-ups) AND
+// legacy schemas (with Additional context / Key Takeaway) so older
+// messages still render correctly.
 function splitSections(markdown) {
   if (!markdown) return null
-  const re = /^##\s+(From your knowledge base|Additional context|Key Takeaway)\s*$/gim
+  const re = /^##\s+(From your knowledge base|Additional context|Key Takeaway|Follow[- ]?up Questions?|Follow[- ]?ups?)\s*$/gim
   const matches = [...markdown.matchAll(re)]
   if (matches.length === 0) return null
 
-  const out = { kb: '', extra: '', key: '' }
+  const out = { kb: '', extra: '', key: '', followups: [] }
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i]
     const name = m[1].toLowerCase()
     const start = m.index + m[0].length
     const end = i + 1 < matches.length ? matches[i + 1].index : markdown.length
     const body = markdown.slice(start, end).trim()
+
     if (name.startsWith('from your')) out.kb = body
     else if (name.startsWith('additional')) out.extra = body
     else if (name.startsWith('key')) out.key = body
+    else if (name.startsWith('follow')) {
+      // Extract each bullet/numbered item as a clean question string
+      for (const raw of body.split('\n')) {
+        const item = raw.match(/^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$/)
+        if (item) {
+          const cleaned = item[1]
+            .replace(/^\*\*|\*\*$/g, '')      // strip surrounding **bold**
+            .replace(/^["'`]+|["'`]+$/g, '')  // strip surrounding quotes
+            .trim()
+          if (cleaned) out.followups.push(cleaned)
+        }
+      }
+    }
   }
   return out
 }
@@ -40,7 +55,33 @@ function Section({ accent, title, icon, children, dim }) {
   )
 }
 
-export default function MessageBubble({ message }) {
+function FollowUps({ questions, onSelect, disabled }) {
+  if (!questions || questions.length === 0) return null
+  return (
+    <div className="mt-3 rounded-xl border bg-indigo-50 border-indigo-100 px-4 py-3">
+      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide mb-2 text-indigo-700">
+        <span>💬</span>
+        <span>Suggested follow-up questions</span>
+      </div>
+      <div className="flex flex-col gap-2">
+        {questions.map((q, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => onSelect?.(q)}
+            disabled={disabled || !onSelect}
+            className="group text-left px-3 py-2 bg-white hover:bg-indigo-100 border border-indigo-100 hover:border-indigo-300 rounded-lg text-sm text-indigo-800 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-between gap-3"
+          >
+            <span>{q}</span>
+            <span className="text-indigo-400 group-hover:text-indigo-600 text-xs shrink-0">→</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+export default function MessageBubble({ message, onSendQuestion, isBusy }) {
   const [feedback, setFeedback] = useState(message.feedback || null)
   const [submitting, setSubmitting] = useState(false)
   const isUser = message.role === 'user'
@@ -97,6 +138,7 @@ export default function MessageBubble({ message }) {
                 </ReactMarkdown>
               </Section>
             )}
+            {/* Legacy: render Key Takeaway only if present in older saved messages */}
             {sections.key && (
               <Section
                 accent="bg-green-50 border-green-100"
@@ -108,6 +150,11 @@ export default function MessageBubble({ message }) {
                 </ReactMarkdown>
               </Section>
             )}
+            <FollowUps
+              questions={sections.followups}
+              onSelect={onSendQuestion}
+              disabled={isBusy}
+            />
           </>
         ) : (
           <div className="markdown text-gray-800">

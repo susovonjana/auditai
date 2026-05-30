@@ -107,7 +107,11 @@ export default function ChatPage() {
       </header>
 
       {hasMessages ? (
-        <ChatWindow messages={messages} isWaiting={isWaiting} />
+        <ChatWindow
+          messages={messages}
+          isWaiting={isWaiting}
+          onSendQuestion={handleSend}
+        />
       ) : (
         <div className="flex-1 flex items-center justify-center py-8">
           <SuggestedQuestions onSelect={handleSend} />

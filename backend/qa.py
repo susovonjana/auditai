@@ -123,8 +123,13 @@ Your response MUST use exactly these two sections in this order:
 - Keep paragraphs short — 2-3 sentences each.
 - If the provided context does not contain a useful answer, write exactly: "The knowledge base does not contain a specific answer to this question."
 
-## Key Takeaway
-- One short paragraph (max 2 sentences) synthesising the single most important point the auditor should walk away with.
+## Follow-up Questions
+Generate EXACTLY three short follow-up questions the user is likely to ask next, given the topic and what is available in the knowledge base context. Output them as a plain bullet list with `-`, one question per line, no extra commentary. Each question must:
+- Be a natural next step or deeper dive on the same topic
+- Be answerable using the same or related parts of the knowledge base (don't suggest topics that aren't there)
+- Be 4-12 words long, phrased as a real question ending with `?`
+- NOT repeat the user's current question
+- NOT include numbering, prefixes like "Q:", or bold formatting
 
 FORMATTING RULES (apply throughout):
 
@@ -419,7 +424,7 @@ def _build_user_prompt(
         f"{_format_history(history)}"
         "Answer the question below using ONLY the KNOWLEDGE BASE CONTEXT. "
         "Output exactly two sections: '## From your knowledge base' and "
-        "'## Key Takeaway'. Do not add any other sections.\n\n"
+        "'## Follow-up Questions' (3 bullets). Do not add any other sections.\n\n"
         "=== KNOWLEDGE BASE CONTEXT ===\n"
         f"{context_text}\n"
         "=== END CONTEXT ===\n\n"
@@ -434,9 +439,10 @@ EMPTY_KB_TEXT = (
     "## From your knowledge base\n"
     "The knowledge base does not contain a specific answer to this question. "
     "Please ask your administrator to upload the relevant documentation.\n\n"
-    "## Key Takeaway\n"
-    "I can only answer using documents your firm has uploaded. Try a different "
-    "question or check back once more documents are added to the knowledge base."
+    "## Follow-up Questions\n"
+    "- What documents are currently in the knowledge base?\n"
+    "- How do I upload audit standards or firm policies?\n"
+    "- What types of audit questions can AuditAI answer?"
 )
 
 

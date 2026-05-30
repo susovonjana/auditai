@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import MessageBubble from './MessageBubble.jsx'
 import TypingIndicator from './TypingIndicator.jsx'
 
-export default function ChatWindow({ messages, isWaiting }) {
+export default function ChatWindow({ messages, isWaiting, onSendQuestion }) {
   const endRef = useRef(null)
 
   useEffect(() => {
@@ -20,7 +20,14 @@ export default function ChatWindow({ messages, isWaiting }) {
       <div className="max-w-3xl mx-auto">
         {messages.map((m) => {
           if (m.role === 'assistant' && !(m.content || '').trim()) return null
-          return <MessageBubble key={m.id} message={m} />
+          return (
+            <MessageBubble
+              key={m.id}
+              message={m}
+              onSendQuestion={onSendQuestion}
+              isBusy={isWaiting}
+            />
+          )
         })}
         {showTyping && <TypingIndicator />}
         <div ref={endRef} />
