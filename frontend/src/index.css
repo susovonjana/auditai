@@ -54,6 +54,74 @@ html, body, #root {
   background: #f9fafb;
 }
 
+/* Tables — for financial figures, comparisons, ratios */
+.markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.75rem 0;
+  font-size: 0.9rem;
+  background: #ffffff;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px #e5e7eb;
+}
+.markdown thead {
+  background: #eff6ff;
+}
+.markdown th {
+  color: #1e3a8a;
+  font-weight: 600;
+  text-align: left;
+  padding: 0.55rem 0.8rem;
+  border-bottom: 2px solid #c7d2fe;
+  white-space: nowrap;
+}
+.markdown td {
+  padding: 0.5rem 0.8rem;
+  border-bottom: 1px solid #f3f4f6;
+  vertical-align: top;
+  color: #1f2937;
+}
+.markdown tr:last-child td {
+  border-bottom: none;
+}
+.markdown tbody tr:hover td {
+  background: #f9fafb;
+}
+/* GFM emits alignment via inline style; honour it. */
+.markdown th[align="right"],
+.markdown td[align="right"] {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.markdown th[align="center"],
+.markdown td[align="center"] {
+  text-align: center;
+}
+
+/* GFM task lists — checkboxes */
+.markdown ul.contains-task-list {
+  list-style: none;
+  padding-left: 0.25rem;
+}
+.markdown li.task-list-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin: 0.3rem 0;
+}
+.markdown li.task-list-item input[type="checkbox"] {
+  margin-top: 0.3rem;
+  width: 1rem;
+  height: 1rem;
+  accent-color: #2563eb;
+  cursor: default;
+}
+.markdown li.task-list-item input[type="checkbox"]:checked + * {
+  color: #6b7280;
+  text-decoration: line-through;
+}
+
 /* Typing dots animation */
 @keyframes blink {
   0%, 80%, 100% { opacity: 0.2; }

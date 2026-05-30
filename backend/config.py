@@ -68,7 +68,7 @@ USE_RERANKER: bool = os.getenv("USE_RERANKER", "true").lower() == "true"
 
 # --- Chunking ---
 CHUNK_SIZE: int = 1000
-CHUNK_OVERLAP: int = 150
+CHUNK_OVERLAP: int = 250  # bigger overlap reduces "number split from label" cases
 
 # --- Retrieval ---
 # Hybrid: pull more candidates from each retriever, then rerank down to TOP_K.
@@ -80,4 +80,4 @@ SIMILARITY_THRESHOLD: float = 0.30
 CONVERSATION_MEMORY_TURNS: int = 5
 
 # --- Allowed file extensions ---
-ALLOWED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".png", ".jpg", ".jpeg"}
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg"}

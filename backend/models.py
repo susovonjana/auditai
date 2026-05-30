@@ -87,6 +87,12 @@ class DocumentChunk(Base):
         Vector(EMBEDDING_DIMENSIONS), nullable=False
     )
     char_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # New in migration 003 — optional structural metadata about the chunk.
+    page_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    section_heading: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    chunk_type: Mapped[str] = mapped_column(
+        Text, nullable=False, default="text"
+    )  # "text" | "table"
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, List, Optional
 from uuid import UUID
 
+import re
+
 from sqlalchemy import select, desc, text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -89,6 +91,9 @@ class RetrievedChunk:
     similarity: float        # vector similarity (0..1)
     fts_rank: float = 0.0    # FTS rank (raw)
     rerank_score: float = 0.0  # cross-encoder relevance score
+    page_number: Optional[int] = None
+    section_heading: Optional[str] = None
+    chunk_type: str = "text"
 
 
 @dataclass
@@ -105,36 +110,93 @@ class QAResult:
 # ---------------------------------------------------------------------------
 # System prompt — two-section answers with grounded vs supplemental content
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are AuditAI, a senior audit knowledge assistant for professional auditors. Your job is to give answers that are accurate, well-structured, AND educational.
+SYSTEM_PROMPT = """You are AuditAI, a senior audit knowledge assistant for professional auditors. Your job is to give accurate, well-structured answers grounded strictly in the provided context.
 
-You always answer in TWO clearly labelled sections so the user can tell what came from the firm's documents vs your general expert knowledge:
+Your response MUST use exactly these two sections in this order:
 
 ## From your knowledge base
-- Use ONLY the provided context to write this section.
-- Start with a direct one-line answer.
+- Use ONLY the provided KNOWLEDGE BASE CONTEXT to write this section.
+- Start with a direct one-line answer to the question.
 - Use `##` sub-headings to organize multi-part answers when helpful.
 - Use **bold** for key terms, standard names (e.g., **ISA 315**), thresholds, and important figures.
-- Use bullet lists (`-`) for collections and numbered lists (`1.`) for sequences.
 - Reference source documents naturally: "According to ISA 315..." or "As stated in the uploaded compliance guidelines...".
-- Keep paragraphs short — 3-4 sentences each.
+- Keep paragraphs short — 2-3 sentences each.
 - If the provided context does not contain a useful answer, write exactly: "The knowledge base does not contain a specific answer to this question."
 
-## Additional context
-- Add your own expert audit knowledge to make the answer richer, more natural, and more useful.
-- Provide background, real-world examples, related standards, common pitfalls, and how to apply the concept in practice.
-- Be honest that this is supplementary background; never present these statements as if they came from the firm's documents.
-- 2-4 short paragraphs is ideal. Use sub-bullets if helpful.
-- Stay professional, accurate, and aligned with mainstream audit practice (ISA / IAASB / ASB / PCAOB as applicable).
-
 ## Key Takeaway
-- One short paragraph synthesising the single most important point the auditor should walk away with.
+- One short paragraph (max 2 sentences) synthesising the single most important point the auditor should walk away with.
+
+FORMATTING RULES (apply throughout):
+
+1. **Markdown tables**: When presenting tabular data — financial figures, comparisons, ratios, classifications — you MUST use proper Markdown table syntax with pipes and a separator row. Right-align numeric columns using `---:` in the separator row. Never use tab-separated text. Never paste raw rows without pipes.
+
+   Correct example:
+   ```
+   | Component | Basis | Amount (USD) |
+   |---|---|---:|
+   | Profit Before Tax | Audited PY adjusted | 3,000,000 |
+   | Overall Materiality | 5% of PBT | 150,000 |
+   ```
+
+   Wrong (do NOT do this):
+   ```
+   Component    Basis    Amount
+   Profit Before Tax  Audited  3,000,000
+   ```
+
+2. **Bullet lists** (`-`) for collections of items that have no inherent order:
+   - Risks identified
+   - Documents required
+   - Account categories
+
+3. **Numbered lists** (`1.` `2.` `3.`) for steps, sequences, or anything where order matters:
+   1. Plan the audit
+   2. Execute fieldwork
+   3. Issue the opinion
+
+4. **Task lists / checklists** (`- [ ]` for incomplete, `- [x]` for complete) when the answer represents items to verify, check, or complete:
+   - [ ] Confirm bank balances
+   - [x] Reviewed prior-year working papers
+   - [ ] Test journal entries
+
+5. **Bold** for thresholds, standard names, key figures (e.g., **$150,000**, **ISA 315**, **5% of PBT**).
+
+6. **Inline code** (backticks) for account codes, formulas, or technical identifiers (e.g., `1000 Cash`, `=AVG(B2:B12)`).
 
 Hard rules:
-- NEVER put fabricated or invented facts in the "From your knowledge base" section. That section is strictly grounded in the provided context.
-- NEVER refuse to answer when the documents are silent — provide an "Additional context" section with general background instead, and clearly state that the knowledge base does not address the question.
+- Do NOT include an "Additional context" section. Do NOT add background, general knowledge, or supplementary explanations beyond what is in the provided context.
+- NEVER fabricate facts. Everything in "From your knowledge base" must trace back to the provided context.
+- NEVER include inline source citations such as [Source 1], [Source 6, Page 135; Source 7, Page 141], (Source 2), [Page 5], [Sources: 1, 2, 3], or any bracketed/parenthesised reference markers.
 - If a previous Q&A in the conversation provides context for a follow-up ("what about...", "and the threshold?"), treat it as continuation of the same topic.
-- Output must be valid Markdown.
+- Output must be valid Markdown. Be concise — aim for the shortest answer that is complete and accurate.
 """
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: remove any inline source/page citations the model
+# emits despite the instructions. Catches:
+#   [Source 6, Page 135]              [Source 1]
+#   [Source 6, Page 135; Source 7]   [Sources: 1, 2, 3]
+#   [Page 135]                        [Pages 5-7]
+#   (Source 2)                        (Page 4)
+#   (Sources 1, 2)
+# Plus trailing space/punctuation cleanup.
+# ---------------------------------------------------------------------------
+_CITATION_RE = re.compile(
+    r"\s*[\[\(]\s*(?:Source|Sources|Page|Pages|Ref|References?|Excerpt|Excerpts)\b[^\]\)]*[\]\)]",
+    flags=re.IGNORECASE,
+)
+_DANGLING_PUNCT_RE = re.compile(r"\s+([\.\,\;\:\!\?])")
+
+
+def strip_inline_citations(text: str) -> str:
+    """Remove inline source markers and tidy up leftover whitespace."""
+    if not text:
+        return text
+    cleaned = _CITATION_RE.sub("", text)
+    # Collapse "word , next" → "word, next"
+    cleaned = _DANGLING_PUNCT_RE.sub(r"\1", cleaned)
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +212,9 @@ async def _vector_search(
             DocumentChunk.id,
             DocumentChunk.document_id,
             DocumentChunk.content,
+            DocumentChunk.page_number,
+            DocumentChunk.section_heading,
+            DocumentChunk.chunk_type,
             Document.filename,
             DocumentChunk.embedding.cosine_distance(question_embedding).label("dist"),
         )
@@ -166,6 +231,9 @@ async def _vector_search(
             document_filename=r.filename,
             content=r.content,
             similarity=float(1.0 - float(r.dist)),
+            page_number=r.page_number,
+            section_heading=r.section_heading,
+            chunk_type=r.chunk_type or "text",
         )
         for r in rows
     ]
@@ -183,10 +251,13 @@ async def _fts_search(
     sql = sql_text(
         """
         SELECT
-            dc.id            AS id,
-            dc.document_id   AS document_id,
-            dc.content       AS content,
-            d.filename       AS filename,
+            dc.id              AS id,
+            dc.document_id     AS document_id,
+            dc.content         AS content,
+            dc.page_number     AS page_number,
+            dc.section_heading AS section_heading,
+            dc.chunk_type      AS chunk_type,
+            d.filename         AS filename,
             ts_rank(to_tsvector('english', dc.content),
                     plainto_tsquery('english', :q)) AS rank
         FROM document_chunks dc
@@ -206,6 +277,9 @@ async def _fts_search(
             content=r.content,
             similarity=0.0,
             fts_rank=float(r.rank),
+            page_number=r.page_number,
+            section_heading=r.section_heading,
+            chunk_type=r.chunk_type or "text",
         )
         for r in rows
     ]
@@ -322,18 +396,30 @@ def _build_user_prompt(
     chunks: List[RetrievedChunk],
     history: List[SearchHistory],
 ) -> str:
+    # Use plain separators (no brackets) so the model is not tempted to
+    # echo "[Source N]" style references back into its answer.
     context_blocks: List[str] = []
     for i, c in enumerate(chunks, start=1):
-        context_blocks.append(f"[Source {i} — {c.document_filename}]\n{c.content}")
+        loc_parts = []
+        if c.page_number:
+            loc_parts.append(f"page {c.page_number}")
+        if c.section_heading:
+            loc_parts.append(f"section: {c.section_heading}")
+        if c.chunk_type == "table":
+            loc_parts.append("table")
+        loc = f" ({', '.join(loc_parts)})" if loc_parts else ""
+        context_blocks.append(
+            f"--- Excerpt {i} from {c.document_filename}{loc} ---\n{c.content}"
+        )
     context_text = (
-        "\n\n---\n\n".join(context_blocks) if context_blocks else "(no context available)"
+        "\n\n".join(context_blocks) if context_blocks else "(no context available)"
     )
 
     return (
         f"{_format_history(history)}"
-        "Use the KNOWLEDGE BASE CONTEXT below for the 'From your knowledge base' section. "
-        "Use your own expert audit knowledge for the 'Additional context' section. "
-        "Always include both sections plus 'Key Takeaway' as instructed.\n\n"
+        "Answer the question below using ONLY the KNOWLEDGE BASE CONTEXT. "
+        "Output exactly two sections: '## From your knowledge base' and "
+        "'## Key Takeaway'. Do not add any other sections.\n\n"
         "=== KNOWLEDGE BASE CONTEXT ===\n"
         f"{context_text}\n"
         "=== END CONTEXT ===\n\n"
@@ -346,11 +432,11 @@ def _build_user_prompt(
 # ---------------------------------------------------------------------------
 EMPTY_KB_TEXT = (
     "## From your knowledge base\n"
-    "The knowledge base is currently empty. Please contact your administrator "
-    "to upload audit standards, regulations, or internal policies.\n\n"
-    "## Additional context\n"
-    "Once documents are uploaded, AuditAI can answer questions about their "
-    "contents and provide supplementary background from broader audit practice."
+    "The knowledge base does not contain a specific answer to this question. "
+    "Please ask your administrator to upload the relevant documentation.\n\n"
+    "## Key Takeaway\n"
+    "I can only answer using documents your firm has uploaded. Try a different "
+    "question or check back once more documents are added to the knowledge base."
 )
 
 
@@ -361,7 +447,7 @@ def _call_gemini_sync(prompt: str) -> str:
     model = _get_gemini()
     response = model.generate_content(
         prompt,
-        generation_config={"temperature": 0.3, "max_output_tokens": 2000},
+        generation_config={"temperature": 0.2, "max_output_tokens": 1000},
     )
     try:
         return (response.text or "").strip()
@@ -413,6 +499,8 @@ async def answer_question(
         logger.error("Gemini API error: %s", exc)
         raise
 
+    # Strip any inline source citations the model may have produced.
+    answer_text = strip_inline_citations(answer_text)
     was_answered = kb_has_signal and "knowledge base does not contain" not in answer_text.lower()
 
     return QAResult(
@@ -472,7 +560,7 @@ def _stream_gemini_sync(prompt: str):
     model = _get_gemini()
     response_stream = model.generate_content(
         prompt,
-        generation_config={"temperature": 0.3, "max_output_tokens": 2000},
+        generation_config={"temperature": 0.2, "max_output_tokens": 1000},
         stream=True,
     )
     for ev in response_stream:
@@ -493,19 +581,19 @@ async def stream_answer(
     question: str,
 ) -> AsyncIterator[str]:
     """
-    Async generator that yields successive text chunks from the LLM.
+    Async generator that yields successive text chunks from the LLM,
+    stripping any inline source/page citations as they pass through.
 
     If the question was small-talk, yields the canned reply word-by-word.
     If the knowledge base is empty, yields the EMPTY_KB_TEXT in one chunk.
     """
     # --- Small-talk shortcut: stream the canned reply, no LLM call ---
     if preamble.smalltalk_reply:
-        # Split on whitespace but keep the spaces; this feels like real streaming
         words = preamble.smalltalk_reply.split(" ")
         for i, w in enumerate(words):
             chunk = (w + " ") if i < len(words) - 1 else w
             yield chunk
-            await asyncio.sleep(0.015)  # tiny pacing for a natural feel
+            await asyncio.sleep(0.015)
         return
 
     if not preamble.chunks:
@@ -530,8 +618,36 @@ async def stream_answer(
 
     asyncio.create_task(asyncio.to_thread(producer))
 
+    # Streaming citation filter:
+    # We can't apply the regex blindly to each piece because a citation
+    # like "[Source 6, Page 135]" may be split across chunk boundaries.
+    # Strategy: keep an unflushed tail (up to 200 chars). When we see a
+    # "]" or ")" we know any pending bracket is closed and we can clean
+    # the buffer and flush most of it, retaining a small lookbehind.
+    buf = ""
+    LOOKBEHIND = 200
+
     while True:
         piece = await queue.get()
         if piece is None:
             break
-        yield piece
+        buf += piece
+
+        # Only attempt clean+flush when we have a complete bracket or enough text
+        if "]" in piece or ")" in piece or len(buf) > LOOKBEHIND * 4:
+            cleaned = strip_inline_citations(buf)
+            # Keep a trailing window in the buffer in case a citation
+            # starts there but isn't complete yet.
+            if len(cleaned) > LOOKBEHIND:
+                emit = cleaned[:-LOOKBEHIND]
+                buf = cleaned[-LOOKBEHIND:]
+                if emit:
+                    yield emit
+            else:
+                # Not enough cleaned text yet — keep buffering
+                buf = cleaned
+
+    # Final flush: scrub any remaining tail
+    final = strip_inline_citations(buf)
+    if final:
+        yield final

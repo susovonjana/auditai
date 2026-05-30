@@ -34,7 +34,7 @@ from auth import (
     get_current_admin,
     verify_password,
 )
-from chunker import chunk_text
+from chunker import chunk_blocks
 from config import (
     ALLOWED_EXTENSIONS,
     JWT_EXPIRE_HOURS,
@@ -53,7 +53,7 @@ from models import (
 from parser import (
     TextExtractionError,
     UnsupportedFileTypeError,
-    extract_text,
+    extract_blocks,
 )
 import schemas
 
@@ -209,9 +209,9 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
-    # Extract → chunk → embed
+    # Extract structured blocks (text + tables + page numbers)
     try:
-        extracted_text, file_type_label = extract_text(target_path)
+        blocks, file_type_label = extract_blocks(target_path)
     except UnsupportedFileTypeError as exc:
         document.status = "error"
         await db.commit()
@@ -226,8 +226,9 @@ async def upload_document(
         await db.commit()
         raise HTTPException(status_code=500, detail="Failed to parse the uploaded file.")
 
-    chunks = chunk_text(extracted_text)
-    if not chunks:
+    # Chunk while preserving structure (tables stay whole, metadata propagates)
+    parsed_chunks = chunk_blocks(blocks)
+    if not parsed_chunks:
         document.status = "error"
         await db.commit()
         raise HTTPException(
@@ -236,7 +237,7 @@ async def upload_document(
         )
 
     try:
-        vectors = await embed_texts(chunks)
+        vectors = await embed_texts([c.content for c in parsed_chunks])
     except Exception as exc:
         logger.exception("Embedding generation failed: %s", exc)
         document.status = "error"
@@ -246,19 +247,22 @@ async def upload_document(
             detail="Failed to generate embeddings for this document.",
         )
 
-    # Insert chunks
-    for idx, (text_chunk, vec) in enumerate(zip(chunks, vectors)):
+    # Insert chunks with full metadata
+    for pc, vec in zip(parsed_chunks, vectors):
         db.add(
             DocumentChunk(
                 document_id=document.id,
-                chunk_index=idx,
-                content=text_chunk,
+                chunk_index=pc.chunk_index,
+                content=pc.content,
                 embedding=vec,
-                char_count=len(text_chunk),
+                char_count=pc.char_count,
+                page_number=pc.page_number,
+                section_heading=pc.section_heading,
+                chunk_type=pc.chunk_type,
             )
         )
 
-    document.total_chunks = len(chunks)
+    document.total_chunks = len(parsed_chunks)
     document.status = "active"
     await db.commit()
     await db.refresh(document)
@@ -268,7 +272,7 @@ async def upload_document(
         filename=document.filename,
         status=document.status,
         total_chunks=document.total_chunks,
-        message=f"Indexed {len(chunks)} chunks successfully.",
+        message=f"Indexed {len(parsed_chunks)} chunks successfully.",
     )
 
 
