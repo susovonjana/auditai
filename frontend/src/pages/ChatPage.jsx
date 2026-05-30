@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { askQuestionStream, startSession } from '../api.js'
 import ChatWindow from '../components/chat/ChatWindow.jsx'
+import LanguageToggle from '../components/chat/LanguageToggle.jsx'
 import QuestionInput from '../components/chat/QuestionInput.jsx'
 import SuggestedQuestions from '../components/chat/SuggestedQuestions.jsx'
+import { getLanguage, t } from '../i18n.js'
 
 const SESSION_KEY = 'auditai_session_token'
 
@@ -11,7 +13,14 @@ export default function ChatPage() {
   const [sessionToken, setSessionToken] = useState(null)
   const [messages, setMessages] = useState([])
   const [isWaiting, setIsWaiting] = useState(false)
+  const [lang, setLang] = useState(getLanguage())
   const streamRef = useRef(null)
+
+  useEffect(() => {
+    const handler = (e) => setLang(e.detail)
+    window.addEventListener('auditai-lang-change', handler)
+    return () => window.removeEventListener('auditai-lang-change', handler)
+  }, [])
 
   // Acquire (or reuse) a session token on mount
   useEffect(() => {
@@ -62,6 +71,7 @@ export default function ChatPage() {
     setIsWaiting(true)
 
     streamRef.current = await askQuestionStream(sessionToken, question, {
+      language: lang,
       onMeta: (m) => {
         updateMessage(aiId, { documentsReferenced: m.documents || [] })
       },
@@ -92,17 +102,20 @@ export default function ChatPage() {
   return (
     <div className="h-screen flex flex-col bg-gray-50">
       <header className="bg-white border-b border-gray-200 px-4 py-3">
-        <div className="max-w-3xl mx-auto flex items-center justify-between">
+        <div className="max-w-3xl mx-auto flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <span className="text-lg">⚖️</span>
-            <span className="font-semibold text-gray-900">AuditAI Assistant</span>
+            <span className="font-semibold text-gray-900">{t('app_title', lang)}</span>
           </div>
-          <Link
-            to="/admin/login"
-            className="text-xs text-gray-400 hover:text-brand-700"
-          >
-            Admin
-          </Link>
+          <div className="flex items-center gap-3">
+            <LanguageToggle />
+            <Link
+              to="/admin/login"
+              className="text-xs text-gray-400 hover:text-brand-700"
+            >
+              {t('admin_link', lang)}
+            </Link>
+          </div>
         </div>
       </header>
 

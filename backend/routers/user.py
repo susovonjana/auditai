@@ -148,7 +148,9 @@ async def ask(
 
     started = time.perf_counter()
     try:
-        result = await qa.answer_question(db, session.id, payload.question)
+        result = await qa.answer_question(
+            db, session.id, payload.question, language=payload.language,
+        )
     except RuntimeError as exc:
         logger.exception("Q&A engine config error: %s", exc)
         raise HTTPException(
@@ -217,7 +219,9 @@ async def ask_stream(
 
     started = time.perf_counter()
     try:
-        preamble = await qa.prepare_stream(db, session.id, payload.question)
+        preamble = await qa.prepare_stream(
+            db, session.id, payload.question, language=payload.language,
+        )
     except RuntimeError as exc:
         logger.exception("Stream preamble config error: %s", exc)
         raise HTTPException(

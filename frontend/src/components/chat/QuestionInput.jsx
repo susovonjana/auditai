@@ -1,7 +1,14 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { getLanguage, t } from '../../i18n.js'
 
 export default function QuestionInput({ onSend, disabled }) {
   const [value, setValue] = useState('')
+  const [lang, setLang] = useState(getLanguage())
+  useEffect(() => {
+    const h = (e) => setLang(e.detail)
+    window.addEventListener('auditai-lang-change', h)
+    return () => window.removeEventListener('auditai-lang-change', h)
+  }, [])
 
   const submit = (e) => {
     e.preventDefault()
@@ -21,7 +28,7 @@ export default function QuestionInput({ onSend, disabled }) {
           type="text"
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          placeholder="Ask a question about 1audit"
+          placeholder={t('placeholder', lang)}
           disabled={disabled}
           className="flex-1 px-4 py-3 border border-gray-300 rounded-full focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 disabled:bg-gray-50 disabled:text-gray-400"
         />

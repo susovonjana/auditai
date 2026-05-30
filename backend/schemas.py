@@ -101,6 +101,7 @@ class SessionOut(BaseModel):
 class AskRequest(BaseModel):
     session_token: str
     question: str = Field(..., min_length=1, max_length=4000)
+    language: str = Field("en", pattern="^(en|ar)$")  # response language
 
 
 class AskResponse(BaseModel):

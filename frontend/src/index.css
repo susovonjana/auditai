@@ -8,6 +8,28 @@ html, body, #root {
   font-family: 'Inter', system-ui, sans-serif;
 }
 
+/* When the user picks Arabic, the whole document flips to RTL via
+   <html dir="rtl"> and uses a better Arabic-capable font stack. */
+html[lang="ar"] {
+  font-family: 'Segoe UI', 'Tahoma', 'Arial', 'Inter', system-ui, sans-serif;
+}
+html[dir="rtl"] .markdown {
+  text-align: right;
+}
+html[dir="rtl"] .markdown ul,
+html[dir="rtl"] .markdown ol {
+  padding-right: 1.5rem;
+  padding-left: 0;
+}
+html[dir="rtl"] .markdown table th,
+html[dir="rtl"] .markdown table td {
+  text-align: right;
+}
+html[dir="rtl"] .markdown th[align="right"],
+html[dir="rtl"] .markdown td[align="right"] {
+  text-align: left; /* "right" in source means "end of row" — flips with RTL */
+}
+
 /* Markdown styling inside AI message bubbles */
 .markdown h2 {
   font-size: 1.125rem;

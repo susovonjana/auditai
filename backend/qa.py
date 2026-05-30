@@ -110,6 +110,34 @@ class QAResult:
 # ---------------------------------------------------------------------------
 # System prompt — two-section answers with grounded vs supplemental content
 # ---------------------------------------------------------------------------
+# Per-language phrasing for the "no answer" / empty-KB fallback so the
+# heuristic that detects unanswered questions still works in both languages.
+NO_ANSWER_MARKERS = {
+    "en": "the knowledge base does not contain",
+    "ar": "لا تحتوي قاعدة المعرفة",
+}
+
+
+def _language_instruction(language: str) -> str:
+    """Instruction block appended to the user prompt to fix the response language."""
+    if language == "ar":
+        return (
+            "IMPORTANT — RESPONSE LANGUAGE:\n"
+            "Write the entire response in Arabic (العربية). "
+            "Keep the two section markers exactly as '## From your knowledge base' and "
+            "'## Follow-up Questions' in English (the UI needs them in English to parse), "
+            "but ALL content inside both sections must be written in natural, fluent Arabic. "
+            "If the source documents are in English, translate the relevant facts into Arabic "
+            "for the answer. Numbers and dates remain in their original form. "
+            "Follow-up questions must be in Arabic and must end with '؟' (the Arabic question mark). "
+            "If the knowledge base does not contain an answer, write exactly: "
+            "\"لا تحتوي قاعدة المعرفة على إجابة محددة لهذا السؤال.\"\n\n"
+        )
+    return (
+        "RESPONSE LANGUAGE: English.\n\n"
+    )
+
+
 SYSTEM_PROMPT = """You are AuditAI, a senior audit knowledge assistant for professional auditors. Your job is to give accurate, well-structured answers grounded strictly in the provided context.
 
 Your response MUST use exactly these two sections in this order:
@@ -400,6 +428,7 @@ def _build_user_prompt(
     question: str,
     chunks: List[RetrievedChunk],
     history: List[SearchHistory],
+    language: str = "en",
 ) -> str:
     # Use plain separators (no brackets) so the model is not tempted to
     # echo "[Source N]" style references back into its answer.
@@ -421,6 +450,7 @@ def _build_user_prompt(
     )
 
     return (
+        f"{_language_instruction(language)}"
         f"{_format_history(history)}"
         "Answer the question below using ONLY the KNOWLEDGE BASE CONTEXT. "
         "Output exactly two sections: '## From your knowledge base' and "
@@ -444,6 +474,20 @@ EMPTY_KB_TEXT = (
     "- How do I upload audit standards or firm policies?\n"
     "- What types of audit questions can AuditAI answer?"
 )
+
+_EMPTY_KB_TEXT_AR = (
+    "## From your knowledge base\n"
+    "لا تحتوي قاعدة المعرفة على إجابة محددة لهذا السؤال. "
+    "يرجى أن تطلب من المسؤول رفع المستندات ذات الصلة.\n\n"
+    "## Follow-up Questions\n"
+    "- ما هي المستندات المتوفرة حالياً في قاعدة المعرفة؟\n"
+    "- كيف يمكنني رفع معايير التدقيق أو سياسات الشركة؟\n"
+    "- ما هي أنواع أسئلة التدقيق التي يستطيع AuditAI الإجابة عليها؟"
+)
+
+
+def _empty_kb_text(language: str) -> str:
+    return _EMPTY_KB_TEXT_AR if language == "ar" else EMPTY_KB_TEXT
 
 
 # ---------------------------------------------------------------------------
@@ -470,13 +514,14 @@ async def answer_question(
     db: AsyncSession,
     session_id: UUID,
     question: str,
+    language: str = "en",
 ) -> QAResult:
     """Non-streaming end-to-end Q&A. Returns the full QAResult."""
     # --- Small-talk shortcut: skip retrieval and LLM entirely ---
     convo_category = smalltalk.detect(question)
     if convo_category:
         return QAResult(
-            answer=smalltalk.reply_for(convo_category),
+            answer=smalltalk.reply_for(convo_category, language=language),
             was_answered=True,
         )
 
@@ -486,7 +531,7 @@ async def answer_question(
 
     if not chunks:
         return QAResult(
-            answer=EMPTY_KB_TEXT,
+            answer=_empty_kb_text(language),
             was_answered=False,
             question_embedding=question_embedding,
         )
@@ -494,11 +539,11 @@ async def answer_question(
     top_similarity = max((c.similarity for c in chunks), default=0.0)
     kb_has_signal = top_similarity >= SIMILARITY_THRESHOLD
 
-    prompt = _build_user_prompt(question, chunks, history)
+    prompt = _build_user_prompt(question, chunks, history, language=language)
     try:
         answer_text = await asyncio.to_thread(_call_gemini_sync, prompt)
         if not answer_text:
-            answer_text = EMPTY_KB_TEXT
+            answer_text = _empty_kb_text(language)
     except RuntimeError:
         raise
     except Exception as exc:
@@ -507,7 +552,8 @@ async def answer_question(
 
     # Strip any inline source citations the model may have produced.
     answer_text = strip_inline_citations(answer_text)
-    was_answered = kb_has_signal and "knowledge base does not contain" not in answer_text.lower()
+    marker = NO_ANSWER_MARKERS.get(language, NO_ANSWER_MARKERS["en"])
+    was_answered = kb_has_signal and marker not in answer_text.lower()
 
     return QAResult(
         answer=answer_text,
@@ -531,12 +577,14 @@ class StreamPreamble:
     history: List[SearchHistory]
     was_answered_initial: bool  # based on retrieval quality, before LLM
     smalltalk_reply: Optional[str] = None  # set if the question was small-talk
+    language: str = "en"
 
 
 async def prepare_stream(
     db: AsyncSession,
     session_id: UUID,
     question: str,
+    language: str = "en",
 ) -> StreamPreamble:
     # --- Small-talk shortcut ---
     convo_category = smalltalk.detect(question)
@@ -546,7 +594,8 @@ async def prepare_stream(
             chunks=[],
             history=[],
             was_answered_initial=True,
-            smalltalk_reply=smalltalk.reply_for(convo_category),
+            smalltalk_reply=smalltalk.reply_for(convo_category, language=language),
+            language=language,
         )
 
     question_embedding = await embed_query(question)
@@ -558,6 +607,7 @@ async def prepare_stream(
         chunks=chunks,
         history=history,
         was_answered_initial=top_similarity >= SIMILARITY_THRESHOLD,
+        language=language,
     )
 
 
@@ -603,10 +653,12 @@ async def stream_answer(
         return
 
     if not preamble.chunks:
-        yield EMPTY_KB_TEXT
+        yield _empty_kb_text(preamble.language)
         return
 
-    prompt = _build_user_prompt(question, preamble.chunks, preamble.history)
+    prompt = _build_user_prompt(
+        question, preamble.chunks, preamble.history, language=preamble.language,
+    )
 
     # Run the sync generator in a worker thread; pipe pieces back via a queue
     loop = asyncio.get_event_loop()

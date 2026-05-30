@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { sendFeedback } from '../../api.js'
+import { getLanguage, t } from '../../i18n.js'
 
 // Split the AI response into its labelled sections so we can style each
 // one distinctly. Recognises the current schema (KB + Follow-ups) AND
@@ -55,13 +56,13 @@ function Section({ accent, title, icon, children, dim }) {
   )
 }
 
-function FollowUps({ questions, onSelect, disabled }) {
+function FollowUps({ questions, onSelect, disabled, title }) {
   if (!questions || questions.length === 0) return null
   return (
     <div className="mt-3 rounded-xl border bg-indigo-50 border-indigo-100 px-4 py-3">
       <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide mb-2 text-indigo-700">
         <span>💬</span>
-        <span>Suggested follow-up questions</span>
+        <span>{title || 'Suggested follow-up questions'}</span>
       </div>
       <div className="flex flex-col gap-2">
         {questions.map((q, i) => (
@@ -84,8 +85,15 @@ function FollowUps({ questions, onSelect, disabled }) {
 export default function MessageBubble({ message, onSendQuestion, isBusy }) {
   const [feedback, setFeedback] = useState(message.feedback || null)
   const [submitting, setSubmitting] = useState(false)
+  const [lang, setLang] = useState(getLanguage())
   const isUser = message.role === 'user'
   const sections = useMemo(() => splitSections(message.content), [message.content])
+
+  useEffect(() => {
+    const h = (e) => setLang(e.detail)
+    window.addEventListener('auditai-lang-change', h)
+    return () => window.removeEventListener('auditai-lang-change', h)
+  }, [])
 
   const submit = async (value) => {
     if (!message.historyId || submitting) return
@@ -118,7 +126,7 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
             {sections.kb && (
               <Section
                 accent="bg-brand-50 border-brand-100"
-                title="From your knowledge base"
+                title={t('section_kb', lang)}
                 icon="📚"
               >
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -129,7 +137,7 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
             {sections.extra && (
               <Section
                 accent="bg-amber-50 border-amber-100"
-                title="Additional context"
+                title={t('section_extra', lang)}
                 icon="💡"
                 dim
               >
@@ -142,7 +150,7 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
             {sections.key && (
               <Section
                 accent="bg-green-50 border-green-100"
-                title="Key takeaway"
+                title={t('section_key', lang)}
                 icon="🎯"
               >
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -154,6 +162,7 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
               questions={sections.followups}
               onSelect={onSendQuestion}
               disabled={isBusy}
+              title={t('section_followups', lang)}
             />
           </>
         ) : (

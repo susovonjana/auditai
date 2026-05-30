@@ -52,7 +52,7 @@ export const getSessionHistory = (token) =>
 export async function askQuestionStream(
   sessionToken,
   question,
-  { onMeta, onDelta, onDone, onError } = {},
+  { onMeta, onDelta, onDone, onError, language = 'en' } = {},
 ) {
   const controller = new AbortController()
   ;(async () => {
@@ -61,7 +61,11 @@ export async function askQuestionStream(
       resp = await fetch('/ask/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_token: sessionToken, question }),
+        body: JSON.stringify({
+          session_token: sessionToken,
+          question,
+          language,
+        }),
         signal: controller.signal,
       })
     } catch (e) {

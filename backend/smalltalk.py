@@ -20,59 +20,82 @@ from typing import Optional
 # Canned reply pools — picking randomly keeps the bot from sounding robotic.
 # ---------------------------------------------------------------------------
 _REPLIES = {
-    "greeting": [
-        "Hi there! I'm AuditAI, your audit knowledge assistant. Ask me anything about audit standards, procedures, or the documents in your knowledge base.",
-        "Hello! Ready to help with any audit questions you have. What would you like to explore today?",
-        "Hey! Good to see you. What audit topic can I help you with?",
-    ],
-    "how_are_you": [
-        "I'm doing well, thank you for asking! Ready to dive into any audit questions you have. What's on your mind?",
-        "All good here — running smoothly and ready to assist. What audit topic can I help with today?",
-        "I'm great, thanks! Let's get to work. What would you like to look into?",
-    ],
-    "thanks": [
-        "You're welcome! Let me know if you'd like to dig into anything else.",
-        "Happy to help. Any other audit questions on your plate?",
-        "Anytime. Ping me whenever something else comes up.",
-    ],
-    "ok": [
-        "Great. Anything else I can help with?",
-        "Sounds good. Let me know what's next.",
-        "Got it. What else can I look into for you?",
-    ],
-    "bye": [
-        "Goodbye! Come back any time you have audit questions.",
-        "See you later. I'll be here whenever you need a hand.",
-        "Take care! Looking forward to our next session.",
-    ],
-    "who_are_you": [
-        "I'm **AuditAI** — an AI assistant built specifically for audit professionals. I answer questions using the documents in your firm's knowledge base, supplemented with general audit expertise where helpful. Think of me as a colleague who has read every audit standard, regulation, and policy your firm has uploaded.",
-    ],
-    "what_can_you_do": [
-        "Here's what I can help you with:\n\n"
-        "- **Look up audit standards** like ISA, GAAS, PCAOB pronouncements\n"
-        "- **Explain audit concepts** such as materiality, sampling, going concern, and fraud risk\n"
-        "- **Walk through audit procedures** for specific accounts or assertions\n"
-        "- **Answer questions about firm documents** you've uploaded to the knowledge base\n"
-        "- **Provide context and examples** when a topic is unclear\n\n"
-        "Try asking me something like *\"What is materiality?\"* or *\"How do I audit accounts receivable?\"*"
-    ],
-    "compliment": [
-        "Thank you, that's kind of you to say! Happy to keep helping.",
-        "Glad I could help! What else would you like to look into?",
-    ],
-    "apology": [
-        "No need to apologise! What can I help you with?",
-        "All good — ask away whenever you're ready.",
-    ],
-    "yes": [
-        "Got it. What would you like to explore next?",
-        "Sounds good — let me know what you'd like to look at.",
-    ],
-    "no": [
-        "Understood. Let me know if there's something else I can help with.",
-        "No problem. I'm here whenever you need.",
-    ],
+    "en": {
+        "greeting": [
+            "Hi there! I'm AuditAI, your audit knowledge assistant. Ask me anything about audit standards, procedures, or the documents in your knowledge base.",
+            "Hello! Ready to help with any audit questions you have. What would you like to explore today?",
+            "Hey! Good to see you. What audit topic can I help you with?",
+        ],
+        "how_are_you": [
+            "I'm doing well, thank you for asking! Ready to dive into any audit questions you have. What's on your mind?",
+            "All good here — running smoothly and ready to assist. What audit topic can I help with today?",
+        ],
+        "thanks": [
+            "You're welcome! Let me know if you'd like to dig into anything else.",
+            "Happy to help. Any other audit questions on your plate?",
+        ],
+        "ok": [
+            "Great. Anything else I can help with?",
+            "Sounds good. Let me know what's next.",
+        ],
+        "bye": [
+            "Goodbye! Come back any time you have audit questions.",
+            "See you later. I'll be here whenever you need a hand.",
+        ],
+        "who_are_you": [
+            "I'm **AuditAI** — an AI assistant built specifically for audit professionals. I answer questions using the documents in your firm's knowledge base. Think of me as a colleague who has read every audit standard, regulation, and policy your firm has uploaded.",
+        ],
+        "what_can_you_do": [
+            "Here's what I can help you with:\n\n"
+            "- **Look up audit standards** like ISA, GAAS, PCAOB pronouncements\n"
+            "- **Explain audit concepts** such as materiality, sampling, going concern, and fraud risk\n"
+            "- **Walk through audit procedures** for specific accounts or assertions\n"
+            "- **Answer questions about firm documents** you've uploaded to the knowledge base\n\n"
+            "Try asking me something like *\"What is materiality?\"* or *\"How do I audit accounts receivable?\"*"
+        ],
+        "compliment": ["Thank you, that's kind of you to say! Happy to keep helping."],
+        "apology": ["No need to apologise! What can I help you with?"],
+        "yes": ["Got it. What would you like to explore next?"],
+        "no": ["Understood. Let me know if there's something else I can help with."],
+    },
+    "ar": {
+        "greeting": [
+            "مرحباً! أنا AuditAI، مساعدك في معرفة التدقيق. اسألني عن أي معيار أو إجراء تدقيق أو أي مستند في قاعدة المعرفة لديك.",
+            "أهلاً! جاهز لمساعدتك بأي سؤال متعلق بالتدقيق. ما الذي تريد استكشافه اليوم؟",
+            "مرحباً بك! ما الموضوع التدقيقي الذي يمكنني مساعدتك فيه؟",
+        ],
+        "how_are_you": [
+            "بخير، شكراً لسؤالك! جاهز للإجابة عن أي سؤال متعلق بالتدقيق. ما الذي يشغل بالك؟",
+            "كل شيء جيد هنا — جاهز لمساعدتك. أي موضوع تدقيق يمكنني مناقشته معك اليوم؟",
+        ],
+        "thanks": [
+            "العفو! أخبرني إذا أردت التعمق في أي موضوع آخر.",
+            "بكل سرور. هل لديك أسئلة تدقيق أخرى؟",
+        ],
+        "ok": [
+            "ممتاز. هل هناك شيء آخر يمكنني المساعدة به؟",
+            "حسناً. أخبرني بما تريد التالي.",
+        ],
+        "bye": [
+            "إلى اللقاء! عد في أي وقت لديك أسئلة تدقيق.",
+            "أراك لاحقاً. سأكون هنا متى احتجت المساعدة.",
+        ],
+        "who_are_you": [
+            "أنا **AuditAI** — مساعد ذكاء اصطناعي مصمم خصيصاً لمحترفي التدقيق. أجيب على الأسئلة باستخدام المستندات الموجودة في قاعدة المعرفة لشركتك. اعتبرني زميلاً قرأ كل معيار تدقيق ولائحة وسياسة رفعتها شركتك.",
+        ],
+        "what_can_you_do": [
+            "إليك ما يمكنني مساعدتك به:\n\n"
+            "- **البحث في معايير التدقيق** مثل ISA و GAAS و PCAOB\n"
+            "- **شرح مفاهيم التدقيق** كالأهمية النسبية والعينات والاستمرارية ومخاطر الاحتيال\n"
+            "- **استعراض إجراءات التدقيق** لحسابات أو تأكيدات محددة\n"
+            "- **الإجابة عن أسئلة حول مستندات الشركة** التي رفعتها لقاعدة المعرفة\n\n"
+            "جرّب أن تسألني مثلاً: *\"ما هي الأهمية النسبية؟\"* أو *\"كيف أقوم بتدقيق الذمم المدينة؟\"*"
+        ],
+        "compliment": ["شكراً لك، هذا لطف منك! سعيد بمواصلة المساعدة."],
+        "apology": ["لا داعي للاعتذار! بماذا يمكنني مساعدتك؟"],
+        "yes": ["تمام. ما الذي تريد استكشافه التالي؟"],
+        "no": ["مفهوم. أخبرني إذا كان هناك شيء آخر يمكنني المساعدة به."],
+    },
 }
 
 
@@ -86,7 +109,9 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
         "greeting",
         re.compile(
             r"^(hi|hii+|hello+|hey+|yo|howdy|hai|namaste|"
-            r"good\s+(morning|afternoon|evening|day))[\s\.\!\?\,]*$",
+            r"good\s+(morning|afternoon|evening|day)|"
+            r"مرحب[اًا]|أهل[اًا]|السلام\s*عليكم|اهلا|صباح\s*الخير|مساء\s*الخير)"
+            r"[\s\.\!\?\,؟]*$",
             re.IGNORECASE,
         ),
     ),
@@ -104,7 +129,9 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
         re.compile(
             r"^(thanks?(\s+you)?(\s+(so|very)\s+much)?|ty|thx|thnx|"
             r"thank\s+(you|u)\s+(a\s+lot|so\s+much)|much\s+appreciated|"
-            r"appreciate\s+(it|that))[\s\.\!\?\,]*$",
+            r"appreciate\s+(it|that)|"
+            r"شكر[اًا]|شكر[اًا]\s*لك|متشكر|الله\s+يعطيك\s+العافية)"
+            r"[\s\.\!\?\,؟]*$",
             re.IGNORECASE,
         ),
     ),
@@ -121,7 +148,9 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
         "bye",
         re.compile(
             r"^(bye+|good\s*bye|see\s+(you|ya)(\s+(later|soon))?|"
-            r"cya|later|talk\s+(to\s+you\s+)?soon|good\s+night)[\s\.\!\?\,]*$",
+            r"cya|later|talk\s+(to\s+you\s+)?soon|good\s+night|"
+            r"مع\s*السلامة|إلى\s*اللقاء|الى\s*اللقاء|وداع[اًا]|تصبح\s+على\s+خير)"
+            r"[\s\.\!\?\,؟]*$",
             re.IGNORECASE,
         ),
     ),
@@ -195,9 +224,10 @@ def detect(question: str) -> Optional[str]:
     return None
 
 
-def reply_for(category: str) -> str:
-    """Pick a random reply from the named category."""
-    pool = _REPLIES.get(category) or _REPLIES["greeting"]
+def reply_for(category: str, language: str = "en") -> str:
+    """Pick a random reply from the named category in the requested language."""
+    lang_pool = _REPLIES.get(language) or _REPLIES["en"]
+    pool = lang_pool.get(category) or _REPLIES["en"]["greeting"]
     return random.choice(pool)
 
 
