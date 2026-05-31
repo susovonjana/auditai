@@ -52,6 +52,9 @@ numpy<2
 pydantic==2.6.3
 email-validator==2.1.1
 
+# Typo tolerance for retrieval queries (English only)
+pyspellchecker==0.8.1
+
 # --- OPTIONAL paid providers (uncomment if you ever want to switch back) ---
 # openai==1.13.3
 # anthropic==0.18.1

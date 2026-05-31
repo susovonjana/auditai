@@ -37,6 +37,7 @@ from config import (
 from cache import answer_cache
 from embeddings import embed_query
 from models import DocumentChunk, Document, SearchHistory
+from query_preprocessor import correct_typos
 from reranker import rerank
 import smalltalk
 
@@ -605,8 +606,11 @@ async def answer_question(
             similarity_scores=cached.get("similarity_scores", []),
         )
 
-    question_embedding = await embed_query(question)
-    chunks = await retrieve_chunks(db, question, question_embedding, TOP_K_CHUNKS)
+    # Typo-correct the retrieval query (does NOT affect what Gemini sees)
+    retrieval_query = correct_typos(question, language)
+
+    question_embedding = await embed_query(retrieval_query)
+    chunks = await retrieve_chunks(db, retrieval_query, question_embedding, TOP_K_CHUNKS)
     history = await load_recent_history(db, session_id)
 
     if not chunks:
@@ -726,8 +730,10 @@ async def prepare_stream(
             question=question,
         )
 
-    question_embedding = await embed_query(question)
-    chunks = await retrieve_chunks(db, question, question_embedding, TOP_K_CHUNKS)
+    # Typo-correct the retrieval query (Gemini still sees the original)
+    retrieval_query = correct_typos(question, language)
+    question_embedding = await embed_query(retrieval_query)
+    chunks = await retrieve_chunks(db, retrieval_query, question_embedding, TOP_K_CHUNKS)
     history = await load_recent_history(db, session_id)
     top_similarity = max((c.similarity for c in chunks), default=0.0)
     return StreamPreamble(

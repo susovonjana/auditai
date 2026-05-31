@@ -74,7 +74,7 @@ CHUNK_OVERLAP: int = 100  # bigger overlap reduces "number split from label" cas
 # Hybrid: pull more candidates from each retriever, then rerank down to TOP_K.
 INITIAL_CANDIDATES: int = 20
 TOP_K_CHUNKS: int = 8
-SIMILARITY_THRESHOLD: float = 0.30
+SIMILARITY_THRESHOLD: float = 0.22   # was 0.30; lower so close-but-not-exact matches still answer
 
 # --- Conversation memory ---
 CONVERSATION_MEMORY_TURNS: int = 5
