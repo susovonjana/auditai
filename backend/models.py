@@ -44,8 +44,9 @@ class Document(Base):
     category: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(
-        Text, nullable=False, default="processing"
-    )  # "processing" | "active" | "error"
+        Text, nullable=False, default="queued"
+    )  # "queued" | "parsing" | "embedding" | "active" | "error"
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     total_chunks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     uploaded_by: Mapped[str] = mapped_column(Text, nullable=False, default="admin")

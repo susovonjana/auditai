@@ -147,6 +147,7 @@ export const uploadDocument = (file, category, onProgress) => {
 }
 
 export const listDocuments = () => api.get('/admin/documents')
+export const getDocument = (id) => api.get(`/admin/documents/${id}`)
 export const updateDocument = (id, payload) =>
   api.patch(`/admin/documents/${id}`, payload)
 export const deleteDocument = (id) => api.delete(`/admin/documents/${id}`)

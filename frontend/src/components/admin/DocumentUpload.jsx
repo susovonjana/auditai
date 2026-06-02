@@ -1,49 +1,104 @@
-import { useRef, useState } from 'react'
-import { uploadDocument } from '../../api.js'
+import { useEffect, useRef, useState } from 'react'
+import { getDocument, uploadDocument } from '../../api.js'
 
-const ACCEPT = '.pdf,.xlsx,.xls,.png,.jpg,.jpeg'
+const ACCEPT = '.pdf,.xlsx,.xls,.png,.jpg,.jpeg,.docx'
 
-const PHASES = ['Uploading', 'Extracting Text', 'Generating Embeddings', 'Active']
+// Backend status → human-readable phase
+const PHASE_LABELS = {
+  queued: 'Queued',
+  parsing: 'Extracting text',
+  embedding: 'Generating embeddings',
+  active: 'Active',
+  error: 'Error',
+}
+
+const POLL_INTERVAL_MS = 2000
+const POLL_TIMEOUT_MS = 10 * 60 * 1000   // give up after 10 minutes
 
 export default function DocumentUpload({ onUploaded }) {
   const inputRef = useRef(null)
   const [dragOver, setDragOver] = useState(false)
   const [category, setCategory] = useState('')
-  const [items, setItems] = useState([]) // {file, percent, phase, error, doneMessage}
+  const [items, setItems] = useState([])
+
+  // Track active poll intervals so we can clean up on unmount
+  const pollersRef = useRef(new Set())
+  useEffect(() => {
+    return () => {
+      pollersRef.current.forEach((id) => clearInterval(id))
+      pollersRef.current.clear()
+    }
+  }, [])
+
+  const updateItem = (id, patch) => {
+    setItems((p) => p.map((e) => (e.id === id ? { ...e, ...patch } : e)))
+  }
+
+  const pollUntilDone = (entryId, documentId) => {
+    const startedAt = Date.now()
+    const intervalId = setInterval(async () => {
+      try {
+        const r = await getDocument(documentId)
+        const doc = r.data
+        const phaseLabel = PHASE_LABELS[doc.status] || doc.status
+
+        if (doc.status === 'active') {
+          updateItem(entryId, {
+            phase: phaseLabel,
+            doneMessage: `Indexed ${doc.total_chunks} chunks successfully.`,
+          })
+          clearInterval(intervalId)
+          pollersRef.current.delete(intervalId)
+          onUploaded?.()
+        } else if (doc.status === 'error') {
+          updateItem(entryId, {
+            phase: phaseLabel,
+            error: doc.error_message || 'Processing failed.',
+          })
+          clearInterval(intervalId)
+          pollersRef.current.delete(intervalId)
+        } else {
+          // still in flight
+          updateItem(entryId, { phase: phaseLabel })
+        }
+
+        if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+          updateItem(entryId, {
+            error: 'Processing is taking unusually long. Check server logs.',
+          })
+          clearInterval(intervalId)
+          pollersRef.current.delete(intervalId)
+        }
+      } catch (err) {
+        // network blip — let the next tick retry
+      }
+    }, POLL_INTERVAL_MS)
+    pollersRef.current.add(intervalId)
+  }
 
   const startUpload = async (file) => {
     const entry = {
       id: `${file.name}-${Date.now()}`,
       file,
       percent: 0,
-      phase: PHASES[0],
+      phase: 'Uploading',
       error: null,
       doneMessage: null,
     }
     setItems((p) => [entry, ...p])
 
-    const updateItem = (id, patch) => {
-      setItems((p) => p.map((e) => (e.id === id ? { ...e, ...patch } : e)))
-    }
-
     try {
       const resp = await uploadDocument(file, category, (pct) => {
         if (pct >= 100) {
-          updateItem(entry.id, { percent: 100, phase: PHASES[1] })
+          updateItem(entry.id, { percent: 100, phase: 'Queued' })
         } else {
-          updateItem(entry.id, { percent: pct, phase: PHASES[0] })
+          updateItem(entry.id, { percent: pct, phase: 'Uploading' })
         }
       })
-      // The server runs the full pipeline before responding;
-      // show the later phases briefly for UX clarity.
-      updateItem(entry.id, { phase: PHASES[2] })
-      setTimeout(() => {
-        updateItem(entry.id, {
-          phase: PHASES[3],
-          doneMessage: resp.data.message,
-        })
-        onUploaded?.()
-      }, 250)
+      const docId = resp.data.id
+      // Backend now returns 202 immediately — poll for progress
+      updateItem(entry.id, { phase: 'Queued' })
+      pollUntilDone(entry.id, docId)
     } catch (err) {
       updateItem(entry.id, {
         error: err?.response?.data?.detail || 'Upload failed.',
@@ -135,7 +190,8 @@ export default function DocumentUpload({ onUploaded }) {
                     <span className="text-green-700">{it.doneMessage}</span>
                   ) : (
                     <span>
-                      {it.phase} — {it.percent}%
+                      {it.phase}
+                      {it.phase === 'Uploading' ? ` — ${it.percent}%` : ''}
                     </span>
                   )}
                 </div>
@@ -143,8 +199,19 @@ export default function DocumentUpload({ onUploaded }) {
               {!it.error && !it.doneMessage && (
                 <div className="mt-2 h-1.5 bg-gray-100 rounded-full overflow-hidden">
                   <div
-                    className="h-full bg-brand-500 transition-all"
-                    style={{ width: `${it.percent}%` }}
+                    className="h-full bg-brand-500 transition-all auditai-progress-pulse"
+                    style={{
+                      width:
+                        it.phase === 'Uploading'
+                          ? `${it.percent}%`
+                          : it.phase === 'Queued'
+                          ? '20%'
+                          : it.phase === 'Extracting text'
+                          ? '55%'
+                          : it.phase === 'Generating embeddings'
+                          ? '85%'
+                          : '100%',
+                    }}
                   />
                 </div>
               )}

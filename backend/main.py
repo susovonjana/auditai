@@ -57,6 +57,36 @@ async def _seed_initial_admin() -> None:
         logger.info("Seeded initial admin user '%s'.", ADMIN_USERNAME)
 
 
+async def _recover_stale_uploads() -> None:
+    """
+    Mark any document stuck mid-processing as error. Background tasks die
+    when uvicorn restarts; on next boot we surface this clearly so the
+    admin knows to re-upload, instead of leaving zombie 'parsing' rows.
+    """
+    try:
+        from sqlalchemy import update
+        from models import Document
+
+        STALE_STATES = ("queued", "parsing", "embedding")
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                update(Document)
+                .where(Document.status.in_(STALE_STATES))
+                .values(
+                    status="error",
+                    error_message="Upload was interrupted by a server restart. Please re-upload.",
+                )
+            )
+            if result.rowcount:
+                logger.warning(
+                    "Recovered %s stale upload(s) — marked as error.",
+                    result.rowcount,
+                )
+            await db.commit()
+    except Exception as exc:
+        logger.warning("Stale-upload recovery skipped: %s", exc)
+
+
 async def _warm_up_models() -> None:
     """
     Pre-load the embedding model and reranker so the first user request
@@ -83,6 +113,7 @@ async def lifespan(app: FastAPI):
     try:
         await init_db()
         await _seed_initial_admin()
+        await _recover_stale_uploads()
         await _warm_up_models()
     except Exception as exc:  # pragma: no cover
         logger.exception("Startup error: %s", exc)

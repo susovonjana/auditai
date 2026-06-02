@@ -53,7 +53,8 @@ class DocumentOut(BaseModel):
     filename: str
     file_type: str
     category: Optional[str] = None
-    status: str
+    status: str                      # queued | parsing | embedding | active | error
+    error_message: Optional[str] = None
     total_chunks: int
     file_size_bytes: int
     uploaded_by: str

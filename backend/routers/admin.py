@@ -21,6 +21,7 @@ from typing import Optional
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -57,7 +58,7 @@ from file_crypto import (
 )
 from file_validation import FileValidationError, validate_file
 from rate_limit import limiter
-from database import get_db
+from database import AsyncSessionLocal, get_db
 from embeddings import embed_texts
 from models import (
     AdminUser,
@@ -175,19 +176,22 @@ async def kb_status(
 @limiter.limit(RATE_LIMIT_ADMIN_UPLOAD)
 async def upload_document(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     category: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
     admin: AdminUser = Depends(get_current_admin),
 ):
     """
-    Upload a single document. Pipeline:
-      validate extension → buffer to memory → enforce size cap →
-      magic-byte validation → encrypt and write to disk →
-      extract text → chunk → embed → store
+    Upload a document. Returns IMMEDIATELY after the file is validated and
+    safely stored. The heavy work (parse + chunk + embed) runs as a
+    background task so the HTTP request can't time out on large PDFs.
+
+    Frontend should poll GET /admin/documents/{id} to track progress:
+        queued → parsing → embedding → active   (success)
+        queued → parsing → ... → error          (failure)
     """
     filename = file.filename or "uploaded"
-    # Sanitize: strip any path traversal from the user-supplied filename
     filename = Path(filename).name
     ext = Path(filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -196,9 +200,6 @@ async def upload_document(
             detail="This file type is not supported. Please upload PDF, Word, Excel, or image files.",
         )
 
-    # Read into memory up to the size cap so we can magic-byte validate
-    # AND encrypt before touching disk. For >25 MB we'd want streaming
-    # encryption, but the cap protects us here.
     body = bytearray()
     while True:
         chunk = await file.read(1024 * 1024)
@@ -213,20 +214,17 @@ async def upload_document(
     if not body:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
-    # Write to a temp path so file_validation can read magic bytes.
     doc_id = uuid.uuid4()
     stored_name = f"{doc_id}{ext}"
     plain_target: Path = UPLOAD_DIR / stored_name
     plain_target.write_bytes(bytes(body))
 
-    # Magic-byte validation — rejects renamed files
     try:
         validate_file(plain_target, ext)
     except FileValidationError as exc:
         plain_target.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # Now encrypt: write the encrypted version, then remove the plaintext.
     try:
         encrypted_target = encrypt_and_write(bytes(body), plain_target)
     except Exception as exc:
@@ -234,8 +232,6 @@ async def upload_document(
         logger.exception("File encryption failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to securely store the file.")
 
-    # If encryption is on, the plaintext we wrote for validation is no
-    # longer needed — wipe it.
     if encrypted_target != plain_target:
         plain_target.unlink(missing_ok=True)
 
@@ -245,7 +241,7 @@ async def upload_document(
         file_type=ext.lstrip("."),
         category=category,
         file_path=str(encrypted_target),
-        status="processing",
+        status="queued",
         total_chunks=0,
         file_size_bytes=len(body),
         uploaded_by=admin.username,
@@ -254,75 +250,114 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
-    # Extract structured blocks. Decrypt to a temp file for the parser.
-    try:
-        with open_decrypted(encrypted_target) as work_path:
-            blocks, file_type_label = extract_blocks(work_path)
-    except UnsupportedFileTypeError as exc:
-        document.status = "error"
-        await db.commit()
-        raise HTTPException(status_code=400, detail=str(exc))
-    except TextExtractionError as exc:
-        document.status = "error"
-        await db.commit()
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Text extraction failed: %s", exc)
-        document.status = "error"
-        await db.commit()
-        raise HTTPException(status_code=500, detail="Failed to parse the uploaded file.")
-
-    # Chunk while preserving structure (tables stay whole, metadata propagates)
-    parsed_chunks = chunk_blocks(blocks)
-    if not parsed_chunks:
-        document.status = "error"
-        await db.commit()
-        raise HTTPException(
-            status_code=400,
-            detail="Could not extract text from this file. Please verify the file is not corrupted or password-protected.",
-        )
-
-    try:
-        vectors = await embed_texts([c.content for c in parsed_chunks])
-    except Exception as exc:
-        logger.exception("Embedding generation failed: %s", exc)
-        document.status = "error"
-        await db.commit()
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to generate embeddings for this document.",
-        )
-
-    # Insert chunks with full metadata
-    for pc, vec in zip(parsed_chunks, vectors):
-        db.add(
-            DocumentChunk(
-                document_id=document.id,
-                chunk_index=pc.chunk_index,
-                content=pc.content,
-                embedding=vec,
-                char_count=pc.char_count,
-                page_number=pc.page_number,
-                section_heading=pc.section_heading,
-                chunk_type=pc.chunk_type,
-            )
-        )
-
-    document.total_chunks = len(parsed_chunks)
-    document.status = "active"
-    await db.commit()
-    await db.refresh(document)
-
-    # The knowledge base just changed — old cached answers may be stale.
-    answer_cache.clear()
+    # Schedule the heavy lifting to run AFTER the response is sent.
+    background_tasks.add_task(_process_document_background, doc_id)
 
     return schemas.DocumentUploadResponse(
         id=document.id,
         filename=document.filename,
         status=document.status,
-        total_chunks=document.total_chunks,
-        message=f"Indexed {len(parsed_chunks)} chunks successfully.",
+        total_chunks=0,
+        message="Upload received. Processing in background — poll for status.",
     )
+
+
+async def _set_status(doc_id: uuid.UUID, status: str, error: Optional[str] = None) -> None:
+    """Update a document's status in a short-lived DB session."""
+    async with AsyncSessionLocal() as db:
+        doc = await db.get(Document, doc_id)
+        if doc is None:
+            return
+        doc.status = status
+        if error is not None:
+            doc.error_message = error[:1000]
+        await db.commit()
+
+
+async def _process_document_background(doc_id: uuid.UUID) -> None:
+    """
+    Heavy upload pipeline that runs AFTER the HTTP response is sent.
+
+    Updates Document.status as it progresses so the frontend can poll:
+        queued → parsing → embedding → active | error
+    """
+    logger.info("[bg] Processing document %s", doc_id)
+
+    # ---- 1. Parse ----
+    try:
+        await _set_status(doc_id, "parsing")
+        async with AsyncSessionLocal() as db:
+            doc = await db.get(Document, doc_id)
+            if doc is None:
+                logger.error("[bg] Document %s missing, abandoning.", doc_id)
+                return
+            file_path = doc.file_path
+
+        with open_decrypted(file_path) as work_path:
+            blocks, _ = extract_blocks(work_path)
+
+        parsed_chunks = chunk_blocks(blocks)
+        if not parsed_chunks:
+            await _set_status(
+                doc_id,
+                "error",
+                "Could not extract any text from this file. Verify it is not "
+                "corrupted, password-protected, or a low-quality scan.",
+            )
+            return
+    except UnsupportedFileTypeError as exc:
+        await _set_status(doc_id, "error", str(exc))
+        return
+    except TextExtractionError as exc:
+        await _set_status(doc_id, "error", str(exc))
+        return
+    except Exception as exc:
+        logger.exception("[bg] Parsing failed for %s: %s", doc_id, exc)
+        await _set_status(doc_id, "error", f"Failed to parse: {exc}")
+        return
+
+    # ---- 2. Embed ----
+    try:
+        await _set_status(doc_id, "embedding")
+        vectors = await embed_texts([c.content for c in parsed_chunks])
+    except Exception as exc:
+        logger.exception("[bg] Embedding failed for %s: %s", doc_id, exc)
+        await _set_status(
+            doc_id, "error",
+            "Failed to generate embeddings. Check the embedding service.",
+        )
+        return
+
+    # ---- 3. Persist + mark active ----
+    try:
+        async with AsyncSessionLocal() as db:
+            for pc, vec in zip(parsed_chunks, vectors):
+                db.add(
+                    DocumentChunk(
+                        document_id=doc_id,
+                        chunk_index=pc.chunk_index,
+                        content=pc.content,
+                        embedding=vec,
+                        char_count=pc.char_count,
+                        page_number=pc.page_number,
+                        section_heading=pc.section_heading,
+                        chunk_type=pc.chunk_type,
+                    )
+                )
+
+            doc = await db.get(Document, doc_id)
+            if doc is not None:
+                doc.total_chunks = len(parsed_chunks)
+                doc.status = "active"
+                doc.error_message = None
+            await db.commit()
+
+        answer_cache.clear()
+        logger.info("[bg] Indexed %s chunks for %s", len(parsed_chunks), doc_id)
+
+    except Exception as exc:
+        logger.exception("[bg] Persistence failed for %s: %s", doc_id, exc)
+        await _set_status(doc_id, "error", f"Failed to store chunks: {exc}")
 
 
 # ===========================================================================
@@ -337,6 +372,19 @@ async def list_documents(
         select(Document).order_by(desc(Document.uploaded_at))
     )
     return list(result.scalars().all())
+
+
+@router.get("/documents/{document_id}", response_model=schemas.DocumentOut)
+async def get_document(
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    """Poll this endpoint to track background processing status."""
+    doc = await db.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return doc
 
 
 @router.patch("/documents/{document_id}", response_model=schemas.DocumentOut)
