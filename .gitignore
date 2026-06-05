@@ -1,0 +1,36 @@
+# ===== General =====
+# Environment variable secrets (keep .env.example)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# ===== Backend (Python / FastAPI) =====
+backend/venv/
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+backend/uploads/
+*.sqlite3
+*.db
+
+# ===== Frontend (Vite / Node) =====
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/build/
