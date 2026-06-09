@@ -6,6 +6,7 @@ Run locally:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -90,16 +91,22 @@ async def _recover_stale_uploads() -> None:
 async def _warm_up_models() -> None:
     """
     Pre-load the embedding model and reranker so the first user request
-    doesn't pay the 10-second cold-start cost.
+    doesn't pay the 10-second cold-start cost. Loaded in parallel so total
+    warm-up time is max(embed, rerank) instead of their sum.
     """
     try:
         from embeddings import embed_query
         from reranker import rerank
 
-        logger.info("Warming up embedding model...")
-        await embed_query("warmup")
-        logger.info("Warming up reranker model...")
-        await rerank("warmup", ["sample passage one", "sample passage two"])
+        logger.info("Warming up embedding + reranker models in parallel...")
+        results = await asyncio.gather(
+            embed_query("warmup"),
+            rerank("warmup", ["sample passage one", "sample passage two"]),
+            return_exceptions=True,
+        )
+        for name, r in zip(("embedding", "reranker"), results):
+            if isinstance(r, Exception):
+                logger.warning("Warm-up of %s failed (non-fatal): %s", name, r)
         logger.info("Models warm and ready.")
     except Exception as exc:
         # Don't block startup — first request will pay the cold-start cost.

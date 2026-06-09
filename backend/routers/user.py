@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -136,11 +136,47 @@ def _validate_question_payload(question: str) -> None:
 # ---------------------------------------------------------------------------
 # Ask (non-streaming) — kept for compatibility
 # ---------------------------------------------------------------------------
+async def _persist_ask_history(
+    history_id: uuid.UUID,
+    session_id: uuid.UUID,
+    question: str,
+    result: "qa.QAResult",
+    elapsed_ms: int,
+) -> None:
+    """Write the SearchHistory row + bump session counters AFTER the response
+    has been sent. Uses a fresh AsyncSession because the request-scoped one
+    is closed by the time this runs."""
+    try:
+        async with AsyncSessionLocal() as bg:
+            history = SearchHistory(
+                id=history_id,
+                session_id=session_id,
+                question=question,
+                question_embedding=result.question_embedding or None,
+                ai_answer=result.answer,
+                chunks_used=result.chunks_used,
+                documents_referenced=result.documents_referenced,
+                similarity_scores=result.similarity_scores,
+                response_time_ms=elapsed_ms,
+                was_answered=result.was_answered,
+                user_feedback=None,
+            )
+            bg.add(history)
+            sess = await bg.get(UserSession, session_id)
+            if sess is not None:
+                sess.total_questions = (sess.total_questions or 0) + 1
+                sess.last_active_at = datetime.now(timezone.utc)
+            await bg.commit()
+    except Exception as exc:
+        logger.exception("Background persist of /ask history failed: %s", exc)
+
+
 @router.post("/ask", response_model=schemas.AskResponse)
 @limiter.limit(RATE_LIMIT_ASK)
 async def ask(
     request: Request,
     payload: schemas.AskRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     _validate_question_payload(payload.question)
@@ -166,28 +202,19 @@ async def ask(
         )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
-    history = SearchHistory(
-        session_id=session.id,
-        question=payload.question,
-        question_embedding=result.question_embedding or None,
-        ai_answer=result.answer,
-        chunks_used=result.chunks_used,
-        documents_referenced=result.documents_referenced,
-        similarity_scores=result.similarity_scores,
-        response_time_ms=elapsed_ms,
-        was_answered=result.was_answered,
-        user_feedback=None,
+    # Pre-allocate the id so the client can submit feedback on this answer
+    # before the row physically exists. The background write below uses
+    # ON-COMMIT semantics, so feedback submitted in the first ~50ms after
+    # response may briefly 404 — clients should treat that as expected and
+    # retry-on-404 once.
+    history_id = uuid.uuid4()
+    background_tasks.add_task(
+        _persist_ask_history, history_id, session.id, payload.question, result, elapsed_ms,
     )
-    db.add(history)
-
-    session.total_questions = (session.total_questions or 0) + 1
-    session.last_active_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(history)
 
     return schemas.AskResponse(
         answer=result.answer,
-        history_id=history.id,
+        history_id=history_id,
         was_answered=result.was_answered,
         response_time_ms=elapsed_ms,
         documents_referenced=result.document_filenames,

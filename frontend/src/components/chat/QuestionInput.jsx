@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getLanguage, t } from '../../i18n.js'
 
-export default function QuestionInput({ onSend, disabled }) {
+export default function QuestionInput({ onSend, onStop, isWaiting, disabled }) {
   const [value, setValue] = useState('')
   const [lang, setLang] = useState(getLanguage())
   useEffect(() => {
@@ -10,12 +10,20 @@ export default function QuestionInput({ onSend, disabled }) {
     return () => window.removeEventListener('auditai-lang-change', h)
   }, [])
 
+  const inputLocked = disabled || isWaiting
+
   const submit = (e) => {
     e.preventDefault()
+    if (isWaiting) return
     const trimmed = value.trim()
     if (!trimmed || disabled) return
     onSend(trimmed)
     setValue('')
+  }
+
+  const handleStopClick = (e) => {
+    e.preventDefault()
+    onStop?.()
   }
 
   return (
@@ -29,37 +37,33 @@ export default function QuestionInput({ onSend, disabled }) {
           value={value}
           onChange={(e) => setValue(e.target.value)}
           placeholder={t('placeholder', lang)}
-          disabled={disabled}
+          disabled={inputLocked}
           className="flex-1 px-4 py-3 border border-gray-300 rounded-full focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 disabled:bg-gray-50 disabled:text-gray-400"
         />
-        <button
-          type="submit"
-          disabled={disabled || !value.trim()}
-          className="w-12 h-12 rounded-full bg-brand-600 text-white flex items-center justify-center hover:bg-brand-700 disabled:bg-gray-300 transition"
-          aria-label="Send"
-        >
-          {disabled ? (
+        {isWaiting && onStop ? (
+          <button
+            type="button"
+            onClick={handleStopClick}
+            className="w-12 h-12 rounded-full bg-red-600 text-white flex items-center justify-center hover:bg-red-700 transition"
+            aria-label={t('stop', lang)}
+            title={t('stop', lang)}
+          >
             <svg
-              className="animate-spin h-5 w-5"
               xmlns="http://www.w3.org/2000/svg"
-              fill="none"
+              className="h-5 w-5"
               viewBox="0 0 24 24"
+              fill="currentColor"
             >
-              <circle
-                className="opacity-25"
-                cx="12"
-                cy="12"
-                r="10"
-                stroke="currentColor"
-                strokeWidth="4"
-              />
-              <path
-                className="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
-              />
+              <rect x="6" y="6" width="12" height="12" rx="2" />
             </svg>
-          ) : (
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={inputLocked || !value.trim()}
+            className="w-12 h-12 rounded-full bg-brand-600 text-white flex items-center justify-center hover:bg-brand-700 disabled:bg-gray-300 transition"
+            aria-label={t('send', lang)}
+          >
             <svg
               xmlns="http://www.w3.org/2000/svg"
               className="h-5 w-5"
@@ -71,8 +75,8 @@ export default function QuestionInput({ onSend, disabled }) {
               <line x1="22" y1="2" x2="11" y2="13" />
               <polygon points="22 2 15 22 11 13 2 9 22 2" />
             </svg>
-          )}
-        </button>
+          </button>
+        )}
       </div>
     </form>
   )

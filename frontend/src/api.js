@@ -48,15 +48,34 @@ export const getSessionHistory = (token) =>
  *   onError(message)  — also fires for 429 rate limit + 413 too long
  *
  * Returns an AbortController so callers can cancel mid-stream.
+ *
+ * If no chunk arrives for `stallTimeoutMs` (default 60s) the stream is
+ * aborted and onError fires with a stall message. This prevents a hung
+ * server connection from sitting forever.
  */
 export async function askQuestionStream(
   sessionToken,
   question,
-  { onMeta, onDelta, onDone, onError, language = 'en' } = {},
+  { onMeta, onDelta, onDone, onError, language = 'en', stallTimeoutMs = 60000 } = {},
 ) {
   const controller = new AbortController()
+  let stalled = false
+  let stallTimer = null
+  const resetStallTimer = () => {
+    if (stallTimer) clearTimeout(stallTimer)
+    stallTimer = setTimeout(() => {
+      stalled = true
+      try { controller.abort() } catch {}
+      onError?.('The response stalled — no data for 60s. Please try again.')
+    }, stallTimeoutMs)
+  }
+  const clearStallTimer = () => {
+    if (stallTimer) { clearTimeout(stallTimer); stallTimer = null }
+  }
+
   ;(async () => {
     let resp
+    resetStallTimer()
     try {
       resp = await fetch('/ask/stream', {
         method: 'POST',
@@ -69,10 +88,12 @@ export async function askQuestionStream(
         signal: controller.signal,
       })
     } catch (e) {
-      onError?.('Network error contacting AuditAI.')
+      clearStallTimer()
+      if (!stalled) onError?.('Network error contacting AuditAI.')
       return
     }
     if (!resp.ok || !resp.body) {
+      clearStallTimer()
       // Try to surface the server-side reason cleanly
       let detail = `Server error (${resp.status}).`
       try {
@@ -101,6 +122,7 @@ export async function askQuestionStream(
       while (true) {
         const { value, done } = await reader.read()
         if (done) break
+        resetStallTimer()
         buffer += decoder.decode(value, { stream: true })
         let nl
         while ((nl = buffer.indexOf('\n')) !== -1) {
@@ -120,7 +142,9 @@ export async function askQuestionStream(
         }
       }
     } catch (e) {
-      if (e.name !== 'AbortError') onError?.('Stream interrupted.')
+      if (e.name !== 'AbortError' && !stalled) onError?.('Stream interrupted.')
+    } finally {
+      clearStallTimer()
     }
   })()
   return controller

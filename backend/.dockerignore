@@ -1,0 +1,62 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Docker build files (don't ship into themselves)
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Secrets — task definition / Secrets Manager injects these at runtime
+.env
+.env.local
+.env.*.local
+
+# Local Python virtualenv (~1.4 GB) — image installs its own
+.venv
+venv
+env
+ENV
+
+# Python bytecode + caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Test / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Local data — production reads/writes via S3 + RDS
+uploads/
+*.sqlite3
+*.db
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local tooling
+.claude/
+
+# Markdown docs (optional — comment out if you want them in the image)
+README.md
+*.md

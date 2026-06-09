@@ -10,7 +10,7 @@ export default defineConfig({
       // that browser navigations (which request text/html) reach Vite and
       // React Router instead of being proxied to FastAPI as API calls.
       '/admin': {
-        target: 'http://localhost:8000',
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         bypass(req) {
           const accept = req.headers && req.headers.accept
@@ -21,7 +21,7 @@ export default defineConfig({
         },
       },
       '/ask': {
-        target: 'http://localhost:8000',
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         // Streaming responses must not be buffered by the proxy.
         configure: (proxy) => {
@@ -31,9 +31,9 @@ export default defineConfig({
           })
         },
       },
-      '/session': 'http://localhost:8000',
-      '/feedback': 'http://localhost:8000',
-      '/health': 'http://localhost:8000',
+      '/session': 'http://127.0.0.1:8000',
+      '/feedback': 'http://127.0.0.1:8000',
+      '/health': 'http://127.0.0.1:8000',
     },
   },
 })

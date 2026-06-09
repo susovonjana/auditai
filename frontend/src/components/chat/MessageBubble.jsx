@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { sendFeedback } from '../../api.js'
@@ -138,7 +138,7 @@ function FollowUps({ questions, onSelect, disabled, title }) {
   )
 }
 
-export default function MessageBubble({ message, onSendQuestion, isBusy }) {
+function MessageBubble({ message, onSendQuestion, onRetry, isBusy }) {
   const [feedback, setFeedback] = useState(message.feedback || null)
   const [submitting, setSubmitting] = useState(false)
   const [lang, setLang] = useState(getLanguage())
@@ -178,6 +178,47 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
   return (
     <div className="flex justify-start my-3">
       <div className="bg-white border border-gray-200 px-5 py-4 rounded-2xl rounded-tl-sm max-w-[88%] shadow-sm w-full">
+        {message.error && (
+          <div
+            role="alert"
+            className="rounded-xl border border-red-200 bg-red-50 p-3.5 mb-3"
+          >
+            <div className="flex items-start gap-2">
+              <span className="text-red-600 mt-0.5">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5 shrink-0">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <line x1="12" y1="8" x2="12" y2="12"></line>
+                  <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                </svg>
+              </span>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium text-red-900 leading-snug">
+                  {t('error_generic', lang)}
+                </div>
+                <div className="text-xs text-red-700 mt-1 break-words">{message.error}</div>
+                {message.sourceQuestion && onRetry && (
+                  <button
+                    type="button"
+                    onClick={() => onRetry(message.id, message.sourceQuestion)}
+                    disabled={isBusy}
+                    className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white border border-red-300 text-red-700 hover:bg-red-100 transition text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
+                      <polyline points="1 4 1 10 7 10"></polyline>
+                      <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
+                    </svg>
+                    {t('retry', lang)}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {message.stopped && !message.error && (
+          <div className="text-xs italic text-gray-500 mb-2">
+            {t('stopped', lang)}
+          </div>
+        )}
         {noAnswer ? (
           <NoAnswerCard />
         ) : sections ? (
@@ -232,14 +273,30 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
           </div>
         )}
 
-        {/* {message.documentsReferenced?.length > 0 && (
-          <div className="mt-1 text-xs text-gray-500 border-t border-gray-100 pt-2">
-            <span className="font-medium">Sources: </span>
-            {message.documentsReferenced.join(', ')}
+        {!message.error && message.documentsReferenced?.length > 0 && (
+          <div className="mt-3 pt-2 border-t border-gray-100">
+            <div className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-1">
+              {t('sources', lang)}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {message.documentsReferenced.map((src, i) => (
+                <span
+                  key={`${src}-${i}`}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-gray-50 border border-gray-200 text-xs text-gray-700 max-w-full"
+                  title={src}
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3 shrink-0 text-gray-400">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                  </svg>
+                  <span className="truncate">{src}</span>
+                </span>
+              ))}
+            </div>
           </div>
-        )} */}
+        )}
 
-        {!message.streaming && message.historyId && (
+        {!message.streaming && message.historyId && !message.error && (
           <div className="mt-3 flex items-center gap-2 text-xs">
             <button
               type="button"
@@ -273,3 +330,25 @@ export default function MessageBubble({ message, onSendQuestion, isBusy }) {
     </div>
   )
 }
+
+// React.memo + custom equality: skip re-render when fields we render didn't
+// change. Without this, every streamed token re-renders every bubble in the
+// thread (O(n²) over n tokens × m messages).
+const arePropsEqual = (prev, next) => {
+  if (prev.isBusy !== next.isBusy) return false
+  if (prev.onSendQuestion !== next.onSendQuestion) return false
+  if (prev.onRetry !== next.onRetry) return false
+  const a = prev.message
+  const b = next.message
+  return (
+    a.id === b.id &&
+    a.content === b.content &&
+    a.streaming === b.streaming &&
+    a.error === b.error &&
+    a.stopped === b.stopped &&
+    a.historyId === b.historyId &&
+    (a.documentsReferenced?.length || 0) === (b.documentsReferenced?.length || 0)
+  )
+}
+
+export default memo(MessageBubble, arePropsEqual)

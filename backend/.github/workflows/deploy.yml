@@ -1,0 +1,64 @@
+name: Deploy 1audit AI Assistant to ECR
+
+on:
+  push:
+    branches: 
+      - master  # REPLACE this with your actual deployment branch, secrets not supported here
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_ACCOUNT_ID: ${{ secrets.ECR_ACCOUNT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set environment-specific variables
+        id: env_vars
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+            echo "ECR_REPOSITORY_NAME=aura2" >> $GITHUB_ENV            
+            echo "IMAGE_TAG=aura2-latest-$(date +'%Y-%m-%d-%H-%M')" >> $GITHUB_ENV
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build and Push Docker image
+        run: |
+          docker build -t $ECR_REPOSITORY_NAME:$IMAGE_TAG .
+          docker tag $ECR_REPOSITORY_NAME:$IMAGE_TAG $ECR_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:$IMAGE_TAG
+          docker push $ECR_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:$IMAGE_TAG
+
+      - name: Apply ECR Image Lifecycle Policy
+        run: |
+          aws ecr put-lifecycle-policy \
+            --repository-name $ECR_REPOSITORY_NAME \
+            --lifecycle-policy-text '{
+              "rules": [
+                {
+                  "rulePriority": 1,
+                  "description": "Keep only the last 5 images",
+                  "selection": {
+                    "tagStatus": "any",
+                    "countType": "imageCountMoreThan",
+                    "countNumber": 5
+                  },
+                  "action": {
+                    "type": "expire"
+                  }
+                }
+              ]
+            }'
