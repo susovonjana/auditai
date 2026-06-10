@@ -10,9 +10,14 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from this backend folder
+# Load env file based on APP_ENV.
+#   APP_ENV=local      -> .env.local
+#   APP_ENV=production -> .env.production
+#   unset              -> .env  (backwards-compat default)
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+_env_name = os.getenv("APP_ENV", "").strip().lower()
+_env_file = BASE_DIR / (f".env.{_env_name}" if _env_name else ".env")
+load_dotenv(_env_file)
 
 # --- AI provider keys ---
 # Only Gemini is required in the free stack
@@ -26,6 +31,13 @@ OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 DATABASE_URL: str = os.getenv(
     "DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:5432/auditai_db",
+)
+# SSL for RDS in production. Leave DB_SSL_MODE empty for local dev (no SSL).
+# For Aurora/RDS set DB_SSL_MODE=verify-full and ship the AWS RDS CA bundle at
+# DB_SSL_ROOT_CERT (the Dockerfile downloads it to /etc/ssl/certs/rds-global-bundle.pem).
+DB_SSL_MODE: str = os.getenv("DB_SSL_MODE", "")
+DB_SSL_ROOT_CERT: str = os.getenv(
+    "DB_SSL_ROOT_CERT", "/etc/ssl/certs/rds-global-bundle.pem"
 )
 
 # --- JWT ---
@@ -46,7 +58,8 @@ FRONTEND_ORIGIN: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 # --- Uploads ---
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
 MAX_FILE_SIZE_BYTES: int = MAX_FILE_SIZE_MB * 1024 * 1024
-UPLOAD_DIR: Path = BASE_DIR / os.getenv("UPLOAD_DIR", "uploads")
+_upload_dir = os.getenv("UPLOAD_DIR", "uploads")
+UPLOAD_DIR: Path = Path(_upload_dir) if os.path.isabs(_upload_dir) else BASE_DIR / _upload_dir
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Models ---

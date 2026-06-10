@@ -2,6 +2,8 @@
 PostgreSQL + pgvector connection setup.
 Uses SQLAlchemy async with asyncpg driver.
 """
+import ssl
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -10,12 +12,29 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import text
 
-from config import DATABASE_URL
+from config import DATABASE_URL, DB_SSL_MODE, DB_SSL_ROOT_CERT
 
 
 class Base(DeclarativeBase):
     """Shared declarative base for all SQLAlchemy ORM models."""
     pass
+
+
+# asyncpg ignores ?sslmode= in the URL; SSL must be passed via connect_args.
+# verify-full = CA chain check + hostname match (what RDS requires).
+def _build_connect_args() -> dict:
+    if not DB_SSL_MODE or DB_SSL_MODE == "disable":
+        return {}
+    if DB_SSL_MODE == "verify-full":
+        ctx = ssl.create_default_context(cafile=DB_SSL_ROOT_CERT)
+        return {"ssl": ctx}
+    if DB_SSL_MODE == "verify-ca":
+        ctx = ssl.create_default_context(cafile=DB_SSL_ROOT_CERT)
+        ctx.check_hostname = False
+        return {"ssl": ctx}
+    if DB_SSL_MODE in ("require", "prefer", "allow"):
+        return {"ssl": True}
+    raise ValueError(f"Unsupported DB_SSL_MODE: {DB_SSL_MODE!r}")
 
 
 # Async engine — pool_pre_ping helps recover from dropped DB connections
@@ -25,6 +44,7 @@ engine = create_async_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
+    connect_args=_build_connect_args(),
 )
 
 # Session factory — yields AsyncSession instances

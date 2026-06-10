@@ -101,6 +101,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# AWS RDS global CA bundle — required for sslmode=verify-full against Aurora/RDS.
+# Bundle is rotated by AWS periodically; rebuild the image to refresh.
+RUN curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+        -o /etc/ssl/certs/rds-global-bundle.pem \
+    && chmod 644 /etc/ssl/certs/rds-global-bundle.pem
+
 # Bring across installed Python packages and pre-downloaded HF model cache.
 COPY --from=deps   /install /usr/local
 COPY --from=models /models  /models
@@ -117,6 +123,7 @@ COPY --chown=auditai:auditai . /app
 # Writable scratch for any transient file work. The durable store is S3 once
 # you wire up the storage abstraction; locally and during dev this is enough.
 RUN mkdir -p /tmp/uploads \
+    && chown auditai:auditai /app \
     && chown -R auditai:auditai /tmp/uploads /models
 
 USER auditai
