@@ -89,6 +89,12 @@ INITIAL_CANDIDATES: int = 20
 TOP_K_CHUNKS: int = 8
 SIMILARITY_THRESHOLD: float = 0.22   # was 0.30; lower so close-but-not-exact matches still answer
 
+# Multi-query expansion: Gemini rephrases the user's question into N variants
+# (with different domain vocabulary) so vague questions still surface the right
+# chunks. Reranker still scores against the ORIGINAL question.
+USE_QUERY_EXPANSION: bool = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
+QUERY_EXPANSION_N: int = int(os.getenv("QUERY_EXPANSION_N", "3"))
+
 # --- Conversation memory ---
 CONVERSATION_MEMORY_TURNS: int = 5
 

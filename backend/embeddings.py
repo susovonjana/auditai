@@ -102,3 +102,20 @@ async def embed_texts(
     safe_batch = [c if c else " " for c in cleaned]
     vectors = await asyncio.to_thread(_encode_sync, safe_batch)
     return vectors
+
+
+async def embed_queries(questions: List[str]) -> List[List[float]]:
+    """
+    Batch-embed multiple QUERIES (with the bge prefix on each). One thread
+    hop, one model.encode call — ~1.5× the cost of a single query, not N×.
+    Used by multi-query expansion in retrieve_chunks.
+    """
+    if not questions:
+        return []
+    cleaned = [(q or "").replace("\n", " ").strip() for q in questions]
+    if _is_bge_model(LOCAL_EMBEDDING_MODEL):
+        cleaned = [_QUERY_PREFIX + (q if q else " ") for q in cleaned]
+    else:
+        cleaned = [q if q else " " for q in cleaned]
+    vectors = await asyncio.to_thread(_encode_sync, cleaned)
+    return vectors

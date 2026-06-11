@@ -35,8 +35,9 @@ from config import (
     USE_RERANKER,
 )
 from cache import answer_cache
-from embeddings import embed_query
+from embeddings import embed_queries, embed_query
 from models import DocumentChunk, Document, SearchHistory
+from query_expander import expand_query
 from query_preprocessor import correct_typos
 from reranker import rerank
 import smalltalk
@@ -99,6 +100,14 @@ class RetrievedChunk:
 
 
 @dataclass
+class SourceRef:
+    """Structured citation for one chunk-derived source."""
+    document: str
+    page: Optional[int] = None
+    section: Optional[str] = None
+
+
+@dataclass
 class QAResult:
     answer: str
     was_answered: bool
@@ -107,6 +116,31 @@ class QAResult:
     document_filenames: List[str] = field(default_factory=list)
     similarity_scores: List[float] = field(default_factory=list)
     question_embedding: List[float] = field(default_factory=list)
+    sources: List[SourceRef] = field(default_factory=list)
+    confidence: float = 0.0
+
+
+def _build_sources(chunks: List["RetrievedChunk"], limit: int = 5) -> List[SourceRef]:
+    """
+    Build a deduped list of sources from the reranked chunks.
+    Dedup key is (document, page) so the same page isn't listed twice;
+    section is picked from whichever chunk first introduced the (doc,page).
+    """
+    seen: set[tuple[str, Optional[int]]] = set()
+    out: List[SourceRef] = []
+    for c in chunks:
+        key = (c.document_filename, c.page_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(SourceRef(
+            document=c.document_filename,
+            page=c.page_number,
+            section=c.section_heading or None,
+        ))
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -384,15 +418,75 @@ async def _fts_search(
 # ---------------------------------------------------------------------------
 # Reciprocal Rank Fusion
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Confidence scoring — combine multiple signals into one [0,1] number used
+# as the "do we have a real answer?" gate. Replaces a similarity-only check.
+# ---------------------------------------------------------------------------
+CONFIDENCE_THRESHOLD = 0.45  # tuned: similarity 0.22 ≈ confidence 0.45 in mixed cases
+
+# Cross-encoder/ms-marco logits typically sit in [-12, +12]; sigmoid maps
+# them to [0,1] cleanly so we can weight them alongside cosine similarity.
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        import math
+        return 1.0 / (1.0 + math.exp(-x))
+    import math
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _confidence_score(chunks: List["RetrievedChunk"]) -> tuple[float, float]:
+    """
+    Return (confidence, top_similarity). Confidence blends:
+      - top similarity         (0.30 weight)  — direct embedding match
+      - top reranker score     (0.50 weight)  — cross-encoder is best signal
+      - source diversity       (0.20 weight)  — multiple docs agreeing
+    Reranker is dropped from the blend (and weight reallocated) if USE_RERANKER
+    is off or no rerank scores were set.
+    """
+    if not chunks:
+        return 0.0, 0.0
+
+    top_similarity = max((c.similarity for c in chunks), default=0.0)
+    top_rerank_raw = max((c.rerank_score for c in chunks), default=0.0)
+    top_rerank_norm = _sigmoid(top_rerank_raw) if top_rerank_raw else 0.0
+    distinct_docs = len({c.document_id for c in chunks})
+    # cap at 3 distinct docs — beyond that there are diminishing returns
+    source_diversity = min(distinct_docs / 3.0, 1.0)
+
+    rerank_available = USE_RERANKER and any(c.rerank_score for c in chunks)
+    if rerank_available:
+        confidence = (
+            0.30 * top_similarity
+            + 0.50 * top_rerank_norm
+            + 0.20 * source_diversity
+        )
+    else:
+        # No reranker → put its weight back on similarity
+        confidence = 0.80 * top_similarity + 0.20 * source_diversity
+    return confidence, top_similarity
+
+
 def _reciprocal_rank_fusion(
-    lists: List[List[RetrievedChunk]], k: int = 60
+    lists: List[List[RetrievedChunk]],
+    k: int = 60,
+    weights: Optional[List[float]] = None,
 ) -> List[RetrievedChunk]:
-    """Combine multiple ranked lists. Higher RRF score = more relevant overall."""
+    """
+    Combine multiple ranked lists. Higher RRF score = more relevant overall.
+    `weights` lets callers boost some lists over others (e.g. vector > FTS).
+    Defaults to equal weighting.
+    """
+    if weights is None:
+        weights = [1.0] * len(lists)
+    elif len(weights) != len(lists):
+        raise ValueError(f"weights len {len(weights)} != lists len {len(lists)}")
+
     scores: dict[UUID, float] = {}
     seen: dict[UUID, RetrievedChunk] = {}
-    for ranked in lists:
+    for ranked, weight in zip(lists, weights):
         for rank, item in enumerate(ranked):
-            scores[item.chunk_id] = scores.get(item.chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            scores[item.chunk_id] = scores.get(item.chunk_id, 0.0) + weight / (k + rank + 1)
             # keep the richest version of the chunk for downstream display
             if item.chunk_id not in seen:
                 seen[item.chunk_id] = item
@@ -444,19 +538,47 @@ async def retrieve_chunks(
     question: str,
     question_embedding: List[float],
     top_k: int = TOP_K_CHUNKS,
+    language: str = "en",
 ) -> List[RetrievedChunk]:
-    # Run vector + FTS in parallel — they're independent and similar speed,
-    # so this saves ~80-100 ms per question.
-    vector_hits, fts_hits = await asyncio.gather(
-        _vector_search(db, question_embedding, INITIAL_CANDIDATES),
-        _safe_fts_search(db, question, INITIAL_CANDIDATES),
-    )
+    # Multi-query expansion: get [original, *rewrites] so retrieval can find
+    # chunks whose vocabulary doesn't match the user's. Falls back to
+    # [question] alone if expansion is disabled or errors out.
+    queries = await expand_query(question, language=language)
 
-    fused = _reciprocal_rank_fusion([vector_hits, fts_hits])
+    # Embed the rewrites in a single batch (the original's embedding was
+    # already computed upstream — no point re-embedding it).
+    if len(queries) > 1:
+        rewrite_embeddings = await embed_queries(queries[1:])
+        embeddings = [question_embedding, *rewrite_embeddings]
+    else:
+        embeddings = [question_embedding]
+
+    # Fan out: one vector + one FTS search per query, all in parallel.
+    # 8 in flight (4 queries × 2) is well within the pool budget (30).
+    vec_tasks = [
+        _vector_search(db, emb, INITIAL_CANDIDATES) for emb in embeddings
+    ]
+    fts_tasks = [
+        _safe_fts_search(db, q, INITIAL_CANDIDATES) for q in queries
+    ]
+    ranked_lists = await asyncio.gather(*vec_tasks, *fts_tasks)
+
+    # Weight vector lists 2× over FTS — semantic match is more reliable than
+    # keyword overlap on natural-language audit questions.
+    n = len(queries)
+    weights = [2.0] * n + [1.0] * n
+    fused = _reciprocal_rank_fusion(ranked_lists, weights=weights)
     if not fused:
         return []
 
-    fused = fused[:INITIAL_CANDIDATES]
+    # Widen the rerank window slightly when we have more queries — RRF
+    # tends to surface different chunks per query in the top section, so
+    # giving the reranker a bit more to chew on materially helps top-k.
+    rerank_window = INITIAL_CANDIDATES * (2 if len(queries) > 1 else 1)
+    fused = fused[:rerank_window]
+
+    # Critical: rerank against the ORIGINAL question, not any expansion —
+    # expansions only widen retrieval; the user's intent is the original.
     reranked = await _rerank_chunks(question, fused)
     return reranked[:top_k]
 
@@ -603,13 +725,17 @@ async def answer_question(
             documents_referenced=cached.get("documents_referenced", []),
             document_filenames=cached.get("document_filenames", []),
             similarity_scores=cached.get("similarity_scores", []),
+            sources=[SourceRef(**s) for s in cached.get("sources", [])],
+            confidence=cached.get("confidence", 0.0),
         )
 
     # Typo-correct the retrieval query (does NOT affect what Gemini sees)
     retrieval_query = correct_typos(question, language)
 
     question_embedding = await embed_query(retrieval_query)
-    chunks = await retrieve_chunks(db, retrieval_query, question_embedding, TOP_K_CHUNKS)
+    chunks = await retrieve_chunks(
+        db, retrieval_query, question_embedding, TOP_K_CHUNKS, language=language
+    )
     history = await load_recent_history(db, session_id)
 
     if not chunks:
@@ -619,8 +745,16 @@ async def answer_question(
             question_embedding=question_embedding,
         )
 
-    top_similarity = max((c.similarity for c in chunks), default=0.0)
-    kb_has_signal = top_similarity >= SIMILARITY_THRESHOLD
+    confidence, top_similarity = _confidence_score(chunks)
+    kb_has_signal = confidence >= CONFIDENCE_THRESHOLD
+    logger.debug(
+        "Confidence %.3f (top_sim=%.3f, top_rerank=%.3f, distinct_docs=%d) — signal=%s",
+        confidence,
+        top_similarity,
+        max((c.rerank_score for c in chunks), default=0.0),
+        len({c.document_id for c in chunks}),
+        kb_has_signal,
+    )
 
     prompt = _build_user_prompt(question, chunks, history, language=language)
     try:
@@ -652,6 +786,8 @@ async def answer_question(
         document_filenames=list({c.document_filename for c in chunks}),
         similarity_scores=[round(c.similarity, 4) for c in chunks],
         question_embedding=question_embedding,
+        sources=_build_sources(chunks) if was_answered else [],
+        confidence=round(confidence, 4),
     )
 
     # Only cache positive answers — we want unanswered questions to
@@ -667,6 +803,11 @@ async def answer_question(
                 "documents_referenced": result.documents_referenced,
                 "document_filenames": result.document_filenames,
                 "similarity_scores": result.similarity_scores,
+                "sources": [
+                    {"document": s.document, "page": s.page, "section": s.section}
+                    for s in result.sources
+                ],
+                "confidence": result.confidence,
             },
         )
     return result
@@ -732,14 +873,16 @@ async def prepare_stream(
     # Typo-correct the retrieval query (Gemini still sees the original)
     retrieval_query = correct_typos(question, language)
     question_embedding = await embed_query(retrieval_query)
-    chunks = await retrieve_chunks(db, retrieval_query, question_embedding, TOP_K_CHUNKS)
+    chunks = await retrieve_chunks(
+        db, retrieval_query, question_embedding, TOP_K_CHUNKS, language=language
+    )
     history = await load_recent_history(db, session_id)
-    top_similarity = max((c.similarity for c in chunks), default=0.0)
+    confidence, _ = _confidence_score(chunks)
     return StreamPreamble(
         question_embedding=question_embedding,
         chunks=chunks,
         history=history,
-        was_answered_initial=top_similarity >= SIMILARITY_THRESHOLD,
+        was_answered_initial=confidence >= CONFIDENCE_THRESHOLD,
         language=language,
         question=question,
     )

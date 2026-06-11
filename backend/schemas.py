@@ -105,12 +105,21 @@ class AskRequest(BaseModel):
     language: str = Field("en", pattern="^(en|ar)$")  # response language
 
 
+class Source(BaseModel):
+    """One traceable reference contributing to an answer."""
+    document: str
+    page: Optional[int] = None
+    section: Optional[str] = None
+
+
 class AskResponse(BaseModel):
     answer: str
     history_id: UUID
     was_answered: bool
     response_time_ms: int
-    documents_referenced: List[str] = []
+    documents_referenced: List[str] = []  # kept for backwards compat; prefer `sources`
+    sources: List[Source] = []
+    confidence: float = 0.0
 
 
 class FeedbackRequest(BaseModel):

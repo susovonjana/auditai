@@ -206,6 +206,11 @@ async def ask(
         was_answered=result.was_answered,
         response_time_ms=elapsed_ms,
         documents_referenced=result.document_filenames,
+        sources=[
+            schemas.Source(document=s.document, page=s.page, section=s.section)
+            for s in result.sources
+        ],
+        confidence=result.confidence,
     )
 
 
@@ -251,11 +256,18 @@ async def ask_stream(
     async def event_stream():
         accumulated: list[str] = []
         document_filenames = list({c.document_filename for c in preamble.chunks})
+        sources_payload = [
+            {"document": s.document, "page": s.page, "section": s.section}
+            for s in qa._build_sources(preamble.chunks)
+        ]
+        confidence_value, _ = qa._confidence_score(preamble.chunks)
 
         # Emit metadata first
         meta = {
             "type": "meta",
             "documents": document_filenames,
+            "sources": sources_payload,
+            "confidence": round(confidence_value, 4),
             "chunks_found": len(preamble.chunks),
         }
         yield json.dumps(meta) + "\n"
@@ -300,6 +312,8 @@ async def ask_stream(
                     "similarity_scores": [
                         round(c.similarity, 4) for c in preamble.chunks
                     ],
+                    "sources": sources_payload,
+                    "confidence": round(confidence_value, 4),
                 },
             )
 
@@ -341,6 +355,8 @@ async def ask_stream(
                 "was_answered": was_answered,
                 "response_time_ms": elapsed_ms,
                 "documents": document_filenames,
+                "sources": sources_payload,
+                "confidence": round(confidence_value, 4),
             }
         ) + "\n"
 
