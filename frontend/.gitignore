@@ -1,0 +1,22 @@
+# Build output
+dist/
+.vite/
+
+# Dependencies
+node_modules/
+
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Per-developer env overrides — these may contain machine-specific URLs,
+# tokens, or feature flags and must NOT be committed.
+# Vite still loads them automatically based on mode.
+.env.local
+.env.*.local
+
+# Tooling caches
+.eslintcache

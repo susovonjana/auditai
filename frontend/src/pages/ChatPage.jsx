@@ -103,6 +103,56 @@ export default function ChatPage() {
     setIsWaiting(false)
   }, [finalizeStream])
 
+  // Recover from a stale session token: clear it, ask the backend for a new
+  // one, persist, and return it. Used when /ask answers 404 "Session not found".
+  const refreshSession = useCallback(async () => {
+    localStorage.removeItem(SESSION_KEY)
+    const r = await startSession()
+    const fresh = r.data.session_token
+    localStorage.setItem(SESSION_KEY, fresh)
+    setSessionToken(fresh)
+    return fresh
+  }, [])
+
+  const _runStream = useCallback((tokenToUse, question, aiId, attempt) =>
+    askQuestionStream(tokenToUse, question, {
+      language: lang,
+      onMeta: (m) => {
+        updateMessage(aiId, { documentsReferenced: m.documents || [] })
+      },
+      onDelta: (text) => queueDelta(aiId, text),
+      onDone: (d) => {
+        finalizeStream()
+        updateMessage(aiId, {
+          streaming: false,
+          historyId: d.history_id,
+          documentsReferenced: d.documents || [],
+          wasAnswered: d.was_answered,
+        })
+        setIsWaiting(false)
+      },
+      onError: async (err) => {
+        // Auto-recover on stale session: refresh and retry once.
+        if (attempt === 0 && typeof err === 'string' && err.toLowerCase().includes('session')) {
+          try {
+            const fresh = await refreshSession()
+            streamRef.current = await _runStream(fresh, question, aiId, attempt + 1)
+            return
+          } catch {
+            // fall through to surfacing the original error
+          }
+        }
+        finalizeStream()
+        updateMessage(aiId, {
+          streaming: false,
+          error: err || t('error_generic', lang),
+        })
+        setIsWaiting(false)
+      },
+    }),
+    [lang, updateMessage, queueDelta, finalizeStream, refreshSession],
+  )
+
   const handleSend = useCallback(async (question) => {
     if (!sessionToken || isWaiting) return
 
@@ -123,32 +173,8 @@ export default function ChatPage() {
     setMessages((prev) => [...prev, userMsg, aiMsg])
     setIsWaiting(true)
 
-    streamRef.current = await askQuestionStream(sessionToken, question, {
-      language: lang,
-      onMeta: (m) => {
-        updateMessage(aiId, { documentsReferenced: m.documents || [] })
-      },
-      onDelta: (text) => queueDelta(aiId, text),
-      onDone: (d) => {
-        finalizeStream()
-        updateMessage(aiId, {
-          streaming: false,
-          historyId: d.history_id,
-          documentsReferenced: d.documents || [],
-          wasAnswered: d.was_answered,
-        })
-        setIsWaiting(false)
-      },
-      onError: (err) => {
-        finalizeStream()
-        updateMessage(aiId, {
-          streaming: false,
-          error: err || t('error_generic', lang),
-        })
-        setIsWaiting(false)
-      },
-    })
-  }, [sessionToken, isWaiting, lang, updateMessage, queueDelta, finalizeStream])
+    streamRef.current = await _runStream(sessionToken, question, aiId, 0)
+  }, [sessionToken, isWaiting, _runStream])
 
   // Re-run the same question that errored. Drops the failed assistant
   // message so the chat history stays tidy.

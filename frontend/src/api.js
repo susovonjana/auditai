@@ -1,7 +1,14 @@
 import axios from 'axios'
 
+// Base URL for every API call. Resolved from .env.{development,production}
+// at build time. Empty string falls through to vite's dev proxy if someone
+// removes the env var.
+//   .env.development → http://localhost:8000 or the deployed ALB
+//   .env.production  → the deployed ALB (or whatever you deploy behind)
+export const API_BASE_URL = import.meta.env.VITE_API_TARGET || ''
+
 const api = axios.create({
-  baseURL: '',           // dev proxy handles routing; in prod set VITE_API_BASE_URL
+  baseURL: API_BASE_URL,
   timeout: 120000,
 })
 
@@ -77,7 +84,7 @@ export async function askQuestionStream(
     let resp
     resetStallTimer()
     try {
-      resp = await fetch('/ask/stream', {
+      resp = await fetch(`${API_BASE_URL}/ask/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
