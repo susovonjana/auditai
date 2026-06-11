@@ -43,18 +43,6 @@ router = APIRouter(tags=["user"])
 
 
 # ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
-@router.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "service": "AuditAI",
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Session start
 # ---------------------------------------------------------------------------
 @router.post("/session/start", response_model=schemas.SessionStartResponse)

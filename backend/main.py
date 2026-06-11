@@ -23,6 +23,7 @@ from database import AsyncSessionLocal, init_db
 from models import AdminUser
 from rate_limit import limiter
 from routers import admin as admin_router
+from routers import health as health_router
 from routers import user as user_router
 
 logging.basicConfig(
@@ -161,6 +162,7 @@ app.add_middleware(
 )
 
 # --- Routers ---
+app.include_router(health_router.router)
 app.include_router(admin_router.router)
 app.include_router(user_router.router)
 
@@ -174,3 +176,6 @@ async def root():
         "user_endpoints": ["/session/start", "/ask", "/feedback", "/health"],
         "admin_endpoints": ["/admin/login", "/admin/status", "/admin/upload"],
     }
+
+
+

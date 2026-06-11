@@ -1,8 +1,25 @@
 """
 PostgreSQL + pgvector connection setup.
-Uses SQLAlchemy async with asyncpg driver.
+Uses SQLAlchemy async with the asyncpg driver.
+
+TLS / Amazon RDS (Aurora) notes
+-------------------------------
+The asyncpg driver does NOT understand libpq-style connection params such as
+``sslmode=verify-full`` or ``sslrootcert=./global-bundle.pem`` (those belong to
+psycopg2). Instead, TLS is configured by handing asyncpg a real
+``ssl.SSLContext`` through SQLAlchemy's ``connect_args``.
+
+To connect to the Aurora instance, set in your environment / .env:
+
+    DATABASE_URL=postgresql+asyncpg://prod_aura:<password>@one-audit-aura-instance-1.cjwpxsh7zcyc.eu-west-1.rds.amazonaws.com:5432/aura
+    DB_SSLMODE=verify-full
+    DB_SSL_ROOT_CERT=./global-bundle.pem   # AWS RDS global CA bundle
+
+Download the CA bundle once with:
+    curl -o global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 """
 import ssl
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -13,6 +30,8 @@ from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import text
 
 from config import DATABASE_URL, DB_SSL_MODE, DB_SSL_ROOT_CERT
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
 class Base(DeclarativeBase):
