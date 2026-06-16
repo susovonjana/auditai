@@ -63,8 +63,19 @@ UPLOAD_DIR: Path = Path(_upload_dir) if os.path.isabs(_upload_dir) else BASE_DIR
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Models ---
-# Gemini (LLM)
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+# Gemini (LLM). Comma-separated list of model names for failover when one
+# model hits its per-day free-tier quota. Tried in order; left-most first.
+# A single value (no comma) keeps the original single-model behaviour.
+GEMINI_MODEL_RAW: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODELS: list[str] = [m.strip() for m in GEMINI_MODEL_RAW.split(",") if m.strip()] or [
+    "gemini-2.0-flash"
+]
+# Kept for callers that still import the original constant; points at the
+# primary (left-most) model.
+GEMINI_MODEL: str = GEMINI_MODELS[0]
+# How long (seconds) to skip a model after it returns a quota error, so
+# subsequent requests jump straight to the next model in the chain.
+GEMINI_MODEL_COOLDOWN_SEC: int = int(os.getenv("GEMINI_MODEL_COOLDOWN_SEC", "600"))
 
 # Local embeddings (sentence-transformers)
 # bge-small-en-v1.5 is 384-dim and substantially more accurate than MiniLM.

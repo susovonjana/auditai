@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, List, Optional
 from uuid import UUID
@@ -27,7 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import (
     GEMINI_API_KEY,
-    GEMINI_MODEL,
+    GEMINI_MODELS,
+    GEMINI_MODEL_COOLDOWN_SEC,
     INITIAL_CANDIDATES,
     TOP_K_CHUNKS,
     SIMILARITY_THRESHOLD,
@@ -46,17 +48,21 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Gemini client (lazy, configured once)
+# Gemini clients (per-model, lazily built) + quota-cooldown registry.
+# When a model returns 429 we mark it cooled-down so the next request skips
+# it on first attempt and goes straight to the next model in the chain.
 # ---------------------------------------------------------------------------
-_gemini_ready: bool = False
-_gemini_model = None
+_gemini_clients: dict = {}      # model_name -> GenerativeModel
+_gemini_configured: bool = False
+_model_cooldown_until: dict = {}  # model_name -> monotonic seconds
 
 
-def _get_gemini():
-    """Configure and return the Gemini GenerativeModel."""
-    global _gemini_ready, _gemini_model
-    if _gemini_model is not None:
-        return _gemini_model
+def _get_gemini(model_name: str):
+    """Configure and return a Gemini GenerativeModel for a specific name."""
+    global _gemini_configured
+    cached = _gemini_clients.get(model_name)
+    if cached is not None:
+        return cached
 
     if not GEMINI_API_KEY:
         raise RuntimeError(
@@ -71,15 +77,39 @@ def _get_gemini():
             "google-generativeai is not installed. Run: pip install -r requirements.txt"
         ) from exc
 
-    if not _gemini_ready:
+    if not _gemini_configured:
         genai.configure(api_key=GEMINI_API_KEY)
-        _gemini_ready = True
+        _gemini_configured = True
 
-    _gemini_model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
+    client = genai.GenerativeModel(
+        model_name=model_name,
         system_instruction=SYSTEM_PROMPT,
     )
-    return _gemini_model
+    _gemini_clients[model_name] = client
+    return client
+
+
+def _model_order() -> List[str]:
+    """Return GEMINI_MODELS with currently-cooling-down models moved to the
+    end. All models stay in the list so a fully-cooled chain still gets a
+    last-resort try (and surfaces a clean error if every model is exhausted)."""
+    now = time.monotonic()
+    fresh, cooled = [], []
+    for name in GEMINI_MODELS:
+        if _model_cooldown_until.get(name, 0) > now:
+            cooled.append(name)
+        else:
+            fresh.append(name)
+    return fresh + cooled
+
+
+def _mark_quota_exhausted(model_name: str) -> None:
+    _model_cooldown_until[model_name] = time.monotonic() + GEMINI_MODEL_COOLDOWN_SEC
+    logger.info(
+        "Gemini model %s hit quota — cooling down for %ds",
+        model_name,
+        GEMINI_MODEL_COOLDOWN_SEC,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +148,11 @@ class QAResult:
     question_embedding: List[float] = field(default_factory=list)
     sources: List[SourceRef] = field(default_factory=list)
     confidence: float = 0.0
+    # Token usage from the LLM call (0 when no Gemini call happened —
+    # small-talk, cache hits, empty-KB short-circuits).
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 def _build_sources(chunks: List["RetrievedChunk"], limit: int = 5) -> List[SourceRef]:
@@ -682,12 +717,7 @@ def _empty_kb_text(language: str) -> str:
 # ---------------------------------------------------------------------------
 # Single-shot answer (non-streaming) — kept for /ask compatibility
 # ---------------------------------------------------------------------------
-def _call_gemini_sync(prompt: str) -> str:
-    model = _get_gemini()
-    response = model.generate_content(
-        prompt,
-        generation_config={"temperature": 0.2, "max_output_tokens": 1000},
-    )
+def _extract_text(response) -> str:
     try:
         return (response.text or "").strip()
     except Exception:
@@ -697,6 +727,40 @@ def _call_gemini_sync(prompt: str) -> str:
                 if getattr(part, "text", None):
                     parts.append(part.text)
         return "\n".join(parts).strip()
+
+
+def _call_gemini_sync(prompt: str) -> tuple[str, dict]:
+    """Return (text, usage). Iterates through GEMINI_MODELS in priority
+    order, falling back to the next model on quota errors. Raises the last
+    exception if every model is exhausted."""
+    order = _model_order()
+    last_exc: Optional[Exception] = None
+    primary = order[0]
+    for name in order:
+        try:
+            model = _get_gemini(name)
+            response = model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.2, "max_output_tokens": 1000},
+            )
+        except Exception as exc:
+            if is_quota_error(exc):
+                _mark_quota_exhausted(name)
+                last_exc = exc
+                continue
+            raise
+        um = getattr(response, "usage_metadata", None)
+        usage = {
+            "prompt":     int(getattr(um, "prompt_token_count", 0) or 0),
+            "completion": int(getattr(um, "candidates_token_count", 0) or 0),
+            "total":      int(getattr(um, "total_token_count", 0) or 0),
+        }
+        if name != primary:
+            logger.info("Gemini fell back from %s to %s", primary, name)
+        return _extract_text(response), usage
+    # Every model returned a quota error.
+    assert last_exc is not None
+    raise last_exc
 
 
 async def answer_question(
@@ -758,7 +822,7 @@ async def answer_question(
 
     prompt = _build_user_prompt(question, chunks, history, language=language)
     try:
-        answer_text = await asyncio.to_thread(_call_gemini_sync, prompt)
+        answer_text, llm_usage = await asyncio.to_thread(_call_gemini_sync, prompt)
         if not answer_text:
             answer_text = _empty_kb_text(language)
     except RuntimeError:
@@ -788,6 +852,9 @@ async def answer_question(
         question_embedding=question_embedding,
         sources=_build_sources(chunks) if was_answered else [],
         confidence=round(confidence, 4),
+        prompt_tokens=int(llm_usage.get("prompt", 0)),
+        completion_tokens=int(llm_usage.get("completion", 0)),
+        total_tokens=int(llm_usage.get("total", 0)),
     )
 
     # Only cache positive answers — we want unanswered questions to
@@ -831,6 +898,9 @@ class StreamPreamble:
     cached_chunks_used: List[str] = field(default_factory=list)
     cached_similarity: List[float] = field(default_factory=list)
     question: str = ""
+    # Populated by stream_answer() once the LLM stream completes. Keys:
+    # "prompt", "completion", "total" (all int). Empty when no Gemini call.
+    usage: dict = field(default_factory=dict)
 
 
 async def prepare_stream(
@@ -888,25 +958,107 @@ async def prepare_stream(
     )
 
 
-def _stream_gemini_sync(prompt: str):
-    """Yields successive text chunks from Gemini as they arrive."""
-    model = _get_gemini()
-    response_stream = model.generate_content(
-        prompt,
-        generation_config={"temperature": 0.2, "max_output_tokens": 1000},
-        stream=True,
+def is_quota_error(exc: Exception) -> bool:
+    """True if exc looks like a Gemini quota / rate-limit (HTTP 429) error.
+    Matches both the typed `google.api_core.exceptions.ResourceExhausted` and
+    the string form so we stay robust across SDK versions."""
+    name = type(exc).__name__
+    msg = str(exc)
+    return (
+        name == "ResourceExhausted"
+        or "RESOURCE_EXHAUSTED" in msg
+        or "quota" in msg.lower()
+        or msg.startswith("429 ")
     )
-    for ev in response_stream:
+
+
+def friendly_llm_error(exc: Exception) -> str:
+    """Short, user-readable inline message for a failed LLM call. Returned as
+    a markdown italic block so it stands out against the answer body."""
+    if is_quota_error(exc):
+        return (
+            "⚠️ The AI assistant is temporarily at capacity (daily quota reached). Please try again in a minute."
+        )
+    return (
+        "\n\n_⚠️ I couldn't finish generating a response. Please try again._"
+    )
+
+
+def _chunk_text(ev) -> str:
+    try:
+        return ev.text or ""
+    except Exception:
+        t = ""
+        for cand in getattr(ev, "candidates", []) or []:
+            for part in getattr(cand.content, "parts", []) or []:
+                if getattr(part, "text", None):
+                    t += part.text
+        return t
+
+
+def _capture_usage(stream, last_ev, usage_out: dict) -> None:
+    """Prefer the aggregated total on the stream object; fall back to the
+    last chunk's usage_metadata."""
+    for source in (stream, last_ev):
+        um = getattr(source, "usage_metadata", None) if source is not None else None
+        total = int(getattr(um, "total_token_count", 0) or 0)
+        if total > 0:
+            usage_out["prompt"]     = int(getattr(um, "prompt_token_count", 0) or 0)
+            usage_out["completion"] = int(getattr(um, "candidates_token_count", 0) or 0)
+            usage_out["total"]      = total
+            return
+
+
+def _stream_gemini_sync(prompt: str, usage_out: Optional[dict] = None):
+    """Yields successive text chunks from Gemini, with model fallback.
+    Fallback only kicks in BEFORE the first chunk is yielded; once content
+    has reached the user, a mid-stream quota error falls through to the
+    producer's friendly-error path rather than silently swapping models
+    (which would lose the partial answer)."""
+    order = _model_order()
+    last_exc: Optional[Exception] = None
+    primary = order[0]
+    for name in order:
         try:
-            t = ev.text
-        except Exception:
-            t = ""
-            for cand in getattr(ev, "candidates", []) or []:
-                for part in getattr(cand.content, "parts", []) or []:
-                    if getattr(part, "text", None):
-                        t += part.text
+            model = _get_gemini(name)
+            response_stream = model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.2, "max_output_tokens": 1000},
+                stream=True,
+            )
+            iterator = iter(response_stream)
+            # Eagerly pull the first chunk — this is when the SDK actually
+            # contacts the API and raises 429 if the quota is gone.
+            first_ev = next(iterator)
+        except StopIteration:
+            # Model returned zero chunks; not technically quota, but no
+            # answer either — try the next model.
+            continue
+        except Exception as exc:
+            if is_quota_error(exc):
+                _mark_quota_exhausted(name)
+                last_exc = exc
+                continue
+            raise
+        # Past this point we commit to this model. Mid-stream failures
+        # propagate to the caller (producer in stream_answer).
+        if name != primary:
+            logger.info("Gemini fell back from %s to %s", primary, name)
+        last_ev = first_ev
+        t = _chunk_text(first_ev)
         if t:
             yield t
+        for ev in iterator:
+            last_ev = ev
+            t = _chunk_text(ev)
+            if t:
+                yield t
+        if usage_out is not None:
+            _capture_usage(response_stream, last_ev, usage_out)
+        return
+    # Every model returned a quota error before producing any text.
+    assert last_exc is not None
+    raise last_exc
 
 
 async def stream_answer(
@@ -954,11 +1106,13 @@ async def stream_answer(
 
     def producer():
         try:
-            for piece in _stream_gemini_sync(prompt):
+            for piece in _stream_gemini_sync(prompt, usage_out=preamble.usage):
                 asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
         except Exception as exc:
             logger.error("Gemini streaming error: %s", exc)
-            asyncio.run_coroutine_threadsafe(queue.put(f"\n\n_[error: {exc}]_"), loop)
+            asyncio.run_coroutine_threadsafe(
+                queue.put(friendly_llm_error(exc)), loop
+            )
         finally:
             asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # sentinel
 

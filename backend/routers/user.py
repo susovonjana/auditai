@@ -17,10 +17,11 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,6 +50,7 @@ router = APIRouter(tags=["user"])
 @limiter.limit(RATE_LIMIT_SESSION_START)
 async def start_session(
     request: Request,
+    body: Optional[schemas.SessionStartRequest] = Body(None),
     db: AsyncSession = Depends(get_db),
 ):
     token = str(uuid.uuid4())
@@ -57,10 +59,12 @@ async def start_session(
 
     session = UserSession(
         session_token=token,
-        user_identifier="anonymous",
+        user_identifier=(body.user_identifier if body and body.user_identifier else "anonymous"),
         ip_address=client_host,
         user_agent=user_agent,
         total_questions=0,
+        user_id=body.user_id if body else None,
+        organization_id=body.organization_id if body else None,
     )
     db.add(session)
     await db.commit()
@@ -130,6 +134,8 @@ async def _persist_ask_history(
     question: str,
     result: "qa.QAResult",
     elapsed_ms: int,
+    user_id: str | None = None,
+    organization_id: str | None = None,
 ) -> None:
     """Write the SearchHistory row + bump session counters AFTER the response
     has been sent. Uses a fresh AsyncSession because the request-scoped one
@@ -148,6 +154,11 @@ async def _persist_ask_history(
                 response_time_ms=elapsed_ms,
                 was_answered=result.was_answered,
                 user_feedback=None,
+                user_id=user_id,
+                organization_id=organization_id,
+                prompt_tokens=result.prompt_tokens or None,
+                completion_tokens=result.completion_tokens or None,
+                total_tokens=result.total_tokens or None,
             )
             bg.add(history)
             sess = await bg.get(UserSession, session_id)
@@ -184,6 +195,14 @@ async def ask(
         )
     except Exception as exc:
         logger.exception("Q&A engine failure: %s", exc)
+        if qa.is_quota_error(exc):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "The AI assistant is temporarily at capacity (daily quota "
+                    "reached). Please try again in a minute."
+                ),
+            )
         raise HTTPException(
             status_code=502,
             detail="There was a problem generating a response. Please try again.",
@@ -197,7 +216,14 @@ async def ask(
     # retry-on-404 once.
     history_id = uuid.uuid4()
     background_tasks.add_task(
-        _persist_ask_history, history_id, session.id, payload.question, result, elapsed_ms,
+        _persist_ask_history,
+        history_id,
+        session.id,
+        payload.question,
+        result,
+        elapsed_ms,
+        payload.user_id,
+        payload.organization_id,
     )
 
     return schemas.AskResponse(
@@ -211,6 +237,9 @@ async def ask(
             for s in result.sources
         ],
         confidence=result.confidence,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        total_tokens=result.total_tokens,
     )
 
 
@@ -252,6 +281,8 @@ async def ask_stream(
 
     session_id = session.id
     question = payload.question
+    caller_user_id = payload.user_id
+    caller_organization_id = payload.organization_id
 
     async def event_stream():
         accumulated: list[str] = []
@@ -333,6 +364,11 @@ async def ask_stream(
                     response_time_ms=elapsed_ms,
                     was_answered=was_answered,
                     user_feedback=None,
+                    user_id=caller_user_id,
+                    organization_id=caller_organization_id,
+                    prompt_tokens=preamble.usage.get("prompt") or None,
+                    completion_tokens=preamble.usage.get("completion") or None,
+                    total_tokens=preamble.usage.get("total") or None,
                 )
                 bg.add(history)
 
@@ -357,6 +393,9 @@ async def ask_stream(
                 "documents": document_filenames,
                 "sources": sources_payload,
                 "confidence": round(confidence_value, 4),
+                "prompt_tokens": int(preamble.usage.get("prompt", 0) or 0),
+                "completion_tokens": int(preamble.usage.get("completion", 0) or 0),
+                "total_tokens": int(preamble.usage.get("total", 0) or 0),
             }
         ) + "\n"
 
@@ -403,3 +442,35 @@ async def session_history(
         )
     ).scalars().all()
     return list(rows)
+
+
+# ---------------------------------------------------------------------------
+# Session token usage (today, UTC)
+# Used by the chat widget to render "🔢 You used N tokens today" under the
+# header. Scoped to the user_id when known so the count carries across
+# sessions for the same logged-in user; otherwise falls back to this session.
+# ---------------------------------------------------------------------------
+@router.get(
+    "/session/{token}/usage",
+    response_model=schemas.UserUsageResponse,
+)
+async def session_usage(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    session = await _load_session(db, token)
+    midnight = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    if session.user_id:
+        stmt = select(func.coalesce(func.sum(SearchHistory.total_tokens), 0)).where(
+            SearchHistory.user_id == session.user_id,
+            SearchHistory.asked_at >= midnight,
+        )
+    else:
+        stmt = select(func.coalesce(func.sum(SearchHistory.total_tokens), 0)).where(
+            SearchHistory.session_id == session.id,
+            SearchHistory.asked_at >= midnight,
+        )
+    total = (await db.execute(stmt)).scalar() or 0
+    return schemas.UserUsageResponse(total_tokens_today=int(total))

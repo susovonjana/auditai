@@ -15,7 +15,7 @@ import re
 import shutil
 import uuid
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -438,6 +438,8 @@ async def search_history(
     q: Optional[str] = Query(None, description="Keyword filter within question text"),
     answered: Optional[bool] = Query(None),
     session_id: Optional[uuid.UUID] = Query(None),
+    user_id: Optional[str] = Query(None),
+    organization_id: Optional[str] = Query(None),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
     page: int = Query(1, ge=1),
@@ -455,6 +457,10 @@ async def search_history(
         conditions.append(SearchHistory.was_answered.is_(answered))
     if session_id is not None:
         conditions.append(SearchHistory.session_id == session_id)
+    if user_id:
+        conditions.append(SearchHistory.user_id == user_id)
+    if organization_id:
+        conditions.append(SearchHistory.organization_id == organization_id)
     if date_from is not None:
         conditions.append(SearchHistory.asked_at >= date_from)
     if date_to is not None:
@@ -530,6 +536,8 @@ async def export_search_history(
     writer.writerow(
         [
             "asked_at",
+            "organization_id",
+            "user_id",
             "session_id",
             "question",
             "was_answered",
@@ -543,6 +551,8 @@ async def export_search_history(
         writer.writerow(
             [
                 r.asked_at.isoformat(),
+                r.organization_id or "",
+                r.user_id or "",
                 str(r.session_id),
                 r.question,
                 r.was_answered,
@@ -567,6 +577,8 @@ async def export_search_history(
 # ===========================================================================
 @router.get("/analytics/summary", response_model=schemas.AnalyticsSummary)
 async def analytics_summary(
+    user_id: Optional[str] = Query(None),
+    organization_id: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ):
@@ -574,28 +586,46 @@ async def analytics_summary(
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now - timedelta(days=7)
 
+    # Scope every search_history count to the optional user/org filter.
+    scope: list = []
+    if user_id:
+        scope.append(SearchHistory.user_id == user_id)
+    if organization_id:
+        scope.append(SearchHistory.organization_id == organization_id)
+
+    def _scoped(stmt):
+        for cond in scope:
+            stmt = stmt.where(cond)
+        return stmt
+
     total_today = (
         await db.execute(
-            select(func.count(SearchHistory.id)).where(
-                SearchHistory.asked_at >= today_start
+            _scoped(
+                select(func.count(SearchHistory.id)).where(
+                    SearchHistory.asked_at >= today_start
+                )
             )
         )
     ).scalar() or 0
     total_week = (
         await db.execute(
-            select(func.count(SearchHistory.id)).where(
-                SearchHistory.asked_at >= week_start
+            _scoped(
+                select(func.count(SearchHistory.id)).where(
+                    SearchHistory.asked_at >= week_start
+                )
             )
         )
     ).scalar() or 0
     total_all = (
-        await db.execute(select(func.count(SearchHistory.id)))
+        await db.execute(_scoped(select(func.count(SearchHistory.id))))
     ).scalar() or 0
 
     answered = (
         await db.execute(
-            select(func.count(SearchHistory.id)).where(
-                SearchHistory.was_answered.is_(True)
+            _scoped(
+                select(func.count(SearchHistory.id)).where(
+                    SearchHistory.was_answered.is_(True)
+                )
             )
         )
     ).scalar() or 0
@@ -603,20 +633,36 @@ async def analytics_summary(
 
     avg_rt = (
         await db.execute(
-            select(func.coalesce(func.avg(SearchHistory.response_time_ms), 0))
+            _scoped(
+                select(func.coalesce(func.avg(SearchHistory.response_time_ms), 0))
+            )
         )
     ).scalar() or 0
 
-    unique_sessions = (
-        await db.execute(select(func.count(UserSession.id)))
-    ).scalar() or 0
+    if scope:
+        # When filtered, count distinct sessions that produced matching
+        # search_history rows. (Without a filter, fall back to the cheaper
+        # all-sessions count to preserve the original metric.)
+        unique_sessions = (
+            await db.execute(
+                _scoped(
+                    select(func.count(func.distinct(SearchHistory.session_id)))
+                )
+            )
+        ).scalar() or 0
+    else:
+        unique_sessions = (
+            await db.execute(select(func.count(UserSession.id)))
+        ).scalar() or 0
 
     # Most active hour-of-day
     hour_rows = (
         await db.execute(
-            select(
-                func.extract("hour", SearchHistory.asked_at).label("h"),
-                func.count(SearchHistory.id).label("c"),
+            _scoped(
+                select(
+                    func.extract("hour", SearchHistory.asked_at).label("h"),
+                    func.count(SearchHistory.id).label("c"),
+                )
             ).group_by("h").order_by(desc("c"))
         )
     ).all()
@@ -647,12 +693,17 @@ _STOP_WORDS = {
 @router.get("/analytics/top-topics", response_model=schemas.TopTopicsResponse)
 async def top_topics(
     limit: int = Query(10, ge=1, le=50),
+    user_id: Optional[str] = Query(None),
+    organization_id: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     _: AdminUser = Depends(get_current_admin),
 ):
-    questions = (
-        await db.execute(select(SearchHistory.question))
-    ).scalars().all()
+    stmt = select(SearchHistory.question)
+    if user_id:
+        stmt = stmt.where(SearchHistory.user_id == user_id)
+    if organization_id:
+        stmt = stmt.where(SearchHistory.organization_id == organization_id)
+    questions = (await db.execute(stmt)).scalars().all()
 
     counter: Counter[str] = Counter()
     for q in questions:
@@ -664,6 +715,90 @@ async def top_topics(
     top = counter.most_common(limit)
     return schemas.TopTopicsResponse(
         topics=[schemas.TopTopic(keyword=k, count=c) for k, c in top]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Token usage rollup by (day, user, organization)
+# Default window is the last 7 days; admin can widen via date_from / date_to.
+# ---------------------------------------------------------------------------
+@router.get(
+    "/analytics/usage-by-user", response_model=schemas.UsageByUserPage
+)
+async def usage_by_user(
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    user_id: Optional[str] = Query(None),
+    organization_id: Optional[str] = Query(None),
+    sort: str = Query(
+        "date",
+        pattern="^(date|tokens)$",
+        description=(
+            "'date' (default): newest day first, biggest user within each day. "
+            "'tokens': biggest token-burner across the whole window first."
+        ),
+    ),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    if date_to is None:
+        date_to = datetime.now(timezone.utc)
+    if date_from is None:
+        date_from = date_to - timedelta(days=7)
+
+    day_col = func.date(SearchHistory.asked_at).label("day")
+    conditions = [
+        SearchHistory.asked_at >= date_from,
+        SearchHistory.asked_at <= date_to,
+    ]
+    if user_id:
+        conditions.append(SearchHistory.user_id == user_id)
+    if organization_id:
+        conditions.append(SearchHistory.organization_id == organization_id)
+
+    base = (
+        select(
+            day_col,
+            SearchHistory.organization_id,
+            SearchHistory.user_id,
+            func.count(SearchHistory.id).label("questions"),
+            func.coalesce(func.sum(SearchHistory.total_tokens), 0).label("tokens"),
+        )
+        .where(*conditions)
+        .group_by(day_col, SearchHistory.organization_id, SearchHistory.user_id)
+    )
+
+    total = (
+        await db.execute(select(func.count()).select_from(base.subquery()))
+    ).scalar() or 0
+    if sort == "tokens":
+        order_clause = (desc("tokens"), desc("day"))
+    else:  # "date" — default
+        order_clause = (desc("day"), desc("tokens"))
+    rows = (
+        await db.execute(
+            base.order_by(*order_clause)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    return schemas.UsageByUserPage(
+        items=[
+            schemas.UsageByUserRow(
+                day=r.day,
+                organization_id=r.organization_id,
+                user_id=r.user_id,
+                questions=int(r.questions),
+                total_tokens=int(r.tokens),
+            )
+            for r in rows
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
     )
 
 

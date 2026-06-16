@@ -131,6 +131,12 @@ class UserSession(Base):
         DateTime(timezone=True), nullable=True
     )
     total_questions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Identity passed in from the embedding app (e.g. 1audit) at session
+    # creation. Nullable so anonymous traffic still saves.
+    user_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, index=True
+    )
 
     history: Mapped[List["SearchHistory"]] = relationship(
         back_populates="session",
@@ -169,6 +175,17 @@ class SearchHistory(Base):
     user_feedback: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
     )  # "helpful" | "not_helpful" | NULL
+    # Identity passed in from the embedding app (e.g. 1audit). Nullable so
+    # legacy/anonymous traffic still saves.
+    user_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, index=True
+    )
+    # LLM token usage for this answer. 0 / NULL when no Gemini call happened
+    # (small-talk replies, cache hits, empty-KB short-circuits).
+    prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     asked_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )

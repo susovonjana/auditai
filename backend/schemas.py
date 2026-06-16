@@ -1,11 +1,11 @@
 """
 Pydantic request/response schemas for the AuditAI API.
 """
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List, Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 # =========================================================================
@@ -77,9 +77,29 @@ class DocumentUploadResponse(BaseModel):
 # =========================================================================
 # Sessions
 # =========================================================================
+class SessionStartRequest(BaseModel):
+    """Optional payload on POST /session/start. Callers (e.g. the 1audit
+    embed) include identity so the session row carries user_id / org_id."""
+    user_identifier: Optional[str] = None
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
 class SessionStartResponse(BaseModel):
     session_token: str
     started_at: datetime
+
+
+class UserUsageResponse(BaseModel):
+    """Per-user (or per-session) token usage rollup for the day so far (UTC)."""
+    total_tokens_today: int
 
 
 class SessionOut(BaseModel):
@@ -94,6 +114,8 @@ class SessionOut(BaseModel):
     last_active_at: datetime
     ended_at: Optional[datetime] = None
     total_questions: int
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
 
 
 # =========================================================================
@@ -103,6 +125,20 @@ class AskRequest(BaseModel):
     session_token: str
     question: str = Field(..., min_length=1, max_length=4000)
     language: str = Field("en", pattern="^(en|ar)$")  # response language
+    # Optional caller identity (e.g. 1audit embed). Falls through to NULL
+    # in search_history when absent. Accepts int or str — callers often hold
+    # these as numeric IDs in their redux store.
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_ids(cls, v):
+        # Pydantic v2 won't coerce int → str by default; do it here so the
+        # frontend can send raw numeric IDs without serializing them first.
+        if v is None or v == "":
+            return None
+        return str(v)
 
 
 class Source(BaseModel):
@@ -120,6 +156,10 @@ class AskResponse(BaseModel):
     documents_referenced: List[str] = []  # kept for backwards compat; prefer `sources`
     sources: List[Source] = []
     confidence: float = 0.0
+    # LLM token usage (0 when no Gemini call was made).
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 class FeedbackRequest(BaseModel):
@@ -143,6 +183,11 @@ class SearchHistoryItem(BaseModel):
     response_time_ms: int
     was_answered: bool
     user_feedback: Optional[str] = None
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
     asked_at: datetime
 
 
@@ -173,3 +218,19 @@ class TopTopic(BaseModel):
 
 class TopTopicsResponse(BaseModel):
     topics: List[TopTopic]
+
+
+# Token usage rollup by (day, user_id, organization_id)
+class UsageByUserRow(BaseModel):
+    day: date
+    organization_id: Optional[str] = None
+    user_id: Optional[str] = None
+    questions: int
+    total_tokens: int
+
+
+class UsageByUserPage(BaseModel):
+    items: List[UsageByUserRow]
+    total: int
+    page: int
+    page_size: int

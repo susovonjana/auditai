@@ -32,7 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("auditai")
 
-
 async def _seed_initial_admin() -> None:
     """Create the initial admin account on first run."""
     if not ADMIN_USERNAME or not ADMIN_PASSWORD:
@@ -152,6 +151,7 @@ allowed_origins = [
     "http://localhost:3000",
     "http://localhost:3002",       # 1audit dev port
     "http://127.0.0.1:3002",
+    "https://beta.1audit.com/"
 ]
 app.add_middleware(
     CORSMiddleware,
