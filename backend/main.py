@@ -8,18 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import select, text
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from auth import hash_password
+from auth import get_current_admin, hash_password
 from config import ADMIN_PASSWORD, ADMIN_USERNAME, FRONTEND_ORIGIN
-from database import AsyncSessionLocal, init_db
+from database import AsyncSessionLocal, engine, init_db
 from models import AdminUser
 from rate_limit import limiter
 from routers import admin as admin_router
@@ -174,8 +176,117 @@ async def root():
         "status": "running",
         "docs": "/docs",
         "user_endpoints": ["/session/start", "/ask", "/feedback", "/health"],
-        "admin_endpoints": ["/admin/login", "/admin/status", "/admin/upload"],
+        "admin_endpoints": ["/admin/login", "/admin/status", "/admin/upload", "/migrate"],
     }
+
+
+async def _run_alembic(args: list[str]) -> tuple[int, str]:
+    backend_dir = Path(__file__).resolve().parent
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "alembic", *args,
+        cwd=str(backend_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(status_code=504, detail="Alembic command timed out after 5 minutes")
+    return proc.returncode, stdout.decode("utf-8", errors="replace")
+
+
+@app.post("/migrate")
+async def run_migrations(
+    action: str = "upgrade",
+    target: str = "head",
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """
+    Manage Alembic migrations. Admin JWT required.
+
+    Query params:
+      action: one of "upgrade" (default), "stamp", "current", "history", "inspect"
+      target: revision target for upgrade/stamp (default "head")
+
+    Typical first-time fix when DB was created by create_all() (no alembic_version):
+      1) /migrate?action=inspect            -> see actual columns of user_sessions
+      2) /migrate?action=current            -> shows alembic state (likely empty)
+      3) /migrate?action=stamp&target=005_qa_user_org   -> mark 1..5 as applied
+      4) /migrate                            -> upgrade head (runs 006, 007)
+    """
+    logger.info("/migrate action=%s target=%s requested by %s", action, target, admin.username)
+
+    if action == "inspect":
+        async with engine.connect() as conn:
+            tables = (await conn.execute(text(
+                "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"
+            ))).scalars().all()
+            user_sessions_cols = (await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='user_sessions' "
+                "ORDER BY ordinal_position"
+            ))).scalars().all()
+            search_history_cols = (await conn.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='search_history' "
+                "ORDER BY ordinal_position"
+            ))).scalars().all()
+            try:
+                alembic_version = (await conn.execute(text(
+                    "SELECT version_num FROM alembic_version"
+                ))).scalars().all()
+            except Exception:
+                alembic_version = None
+        return {
+            "ok": True,
+            "tables": list(tables),
+            "user_sessions_columns": list(user_sessions_cols),
+            "search_history_columns": list(search_history_cols),
+            "alembic_version_rows": alembic_version,
+        }
+
+    if action == "repair":
+        # Idempotent DDL — adds columns/indexes from migrations 005..007 if missing.
+        # Safe to run multiple times. Use when create_all() built tables before
+        # migrations were written, so columns the models expect aren't in the DB.
+        statements = [
+            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS user_id TEXT',
+            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS organization_id TEXT',
+            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER',
+            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS completion_tokens INTEGER',
+            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS total_tokens INTEGER',
+            'CREATE INDEX IF NOT EXISTS ix_search_history_user_id ON search_history(user_id)',
+            'CREATE INDEX IF NOT EXISTS ix_search_history_organization_id ON search_history(organization_id)',
+            'ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS user_id TEXT',
+            'ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS organization_id TEXT',
+            'CREATE INDEX IF NOT EXISTS ix_user_sessions_user_id ON user_sessions(user_id)',
+            'CREATE INDEX IF NOT EXISTS ix_user_sessions_organization_id ON user_sessions(organization_id)',
+        ]
+        applied = []
+        async with engine.begin() as conn:
+            for stmt in statements:
+                await conn.execute(text(stmt))
+                applied.append(stmt)
+        return {"ok": True, "action": "repair", "applied": applied}
+
+    if action == "current":
+        code, output = await _run_alembic(["current"])
+    elif action == "history":
+        code, output = await _run_alembic(["history"])
+    elif action == "stamp":
+        code, output = await _run_alembic(["stamp", target])
+    elif action == "upgrade":
+        code, output = await _run_alembic(["upgrade", target])
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+
+    if code != 0:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": f"alembic {action} failed", "exit_code": code, "output": output},
+        )
+    return {"ok": True, "action": action, "target": target, "output": output}
 
 
 
