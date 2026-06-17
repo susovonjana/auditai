@@ -113,6 +113,56 @@ def _mark_quota_exhausted(model_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Translation — separate Gemini client (no audit system prompt)
+# ---------------------------------------------------------------------------
+_translate_client = None
+
+_TRANSLATE_SYSTEM_PROMPT = (
+    "You are a precise translation engine. Translate the user's text into the "
+    "requested target language exactly. Preserve all markdown formatting "
+    "(headers, lists, bullets, bold, code blocks, links, tables) byte-for-byte. "
+    "Output only the translation — no preamble, no explanations, no quotation "
+    "marks around the output."
+)
+
+
+def _get_translate_client():
+    """Lazily build a Gemini client dedicated to translation (no audit system prompt)."""
+    global _translate_client, _gemini_configured
+    if _translate_client is not None:
+        return _translate_client
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+    try:
+        import google.generativeai as genai
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "google-generativeai is not installed. Run: pip install -r requirements.txt"
+        ) from exc
+    if not _gemini_configured:
+        genai.configure(api_key=GEMINI_API_KEY)
+        _gemini_configured = True
+    _translate_client = genai.GenerativeModel(
+        model_name=GEMINI_MODELS[0],
+        system_instruction=_TRANSLATE_SYSTEM_PROMPT,
+    )
+    return _translate_client
+
+
+async def translate_text(text: str, target_language: str) -> str:
+    """Translate text to 'en' or 'ar' via Gemini. Preserves markdown."""
+    target_name = "Arabic" if target_language == "ar" else "English"
+    prompt = f"Translate the following text to {target_name}:\n\n{text}"
+    model = _get_translate_client()
+    response = await asyncio.to_thread(
+        model.generate_content,
+        prompt,
+        generation_config={"temperature": 0.1, "max_output_tokens": 4000},
+    )
+    return (_extract_text(response) or "").strip()
+
+
+# ---------------------------------------------------------------------------
 # Result containers
 # ---------------------------------------------------------------------------
 @dataclass

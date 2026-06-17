@@ -118,6 +118,7 @@ RATE_LIMIT_ASK: str = os.getenv("RATE_LIMIT_ASK", "30/hour;200/day")
 RATE_LIMIT_SESSION_START: str = os.getenv("RATE_LIMIT_SESSION_START", "10/minute")
 RATE_LIMIT_ADMIN_LOGIN: str = os.getenv("RATE_LIMIT_ADMIN_LOGIN", "5/minute;30/hour")
 RATE_LIMIT_ADMIN_UPLOAD: str = os.getenv("RATE_LIMIT_ADMIN_UPLOAD", "20/hour")
+RATE_LIMIT_TRANSLATE: str = os.getenv("RATE_LIMIT_TRANSLATE", "60/hour;500/day")
 
 # Per-session hard cap (cheaper than per-IP — applies even if same IP rotates tokens)
 MAX_QUESTIONS_PER_SESSION_DAY: int = int(

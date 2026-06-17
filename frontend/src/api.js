@@ -47,6 +47,13 @@ export const sendFeedback = (historyId, feedback) =>
 export const getSessionHistory = (token) =>
   api.get(`/session/${token}/history`)
 
+export const translateMessage = (sessionToken, text, targetLanguage) =>
+  api.post('/translate', {
+    session_token: sessionToken,
+    text,
+    target_language: targetLanguage,
+  })
+
 /**
  * Stream a /ask/stream response. Calls callbacks as events arrive:
  *   onMeta({documents, chunks_found})

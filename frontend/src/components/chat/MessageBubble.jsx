@@ -1,8 +1,19 @@
 import { memo, useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { sendFeedback } from '../../api.js'
+import { sendFeedback, translateMessage } from '../../api.js'
 import { getLanguage, t } from '../../i18n.js'
+
+const SESSION_KEY = 'auditai_session_token'
+const ARABIC_RE = /[؀-ۿ]/
+
+// Pick the dominant language of a piece of text by scanning the first 200 chars
+// for Arabic Unicode codepoints. Used to decide the translation target.
+function detectLang(text) {
+  if (!text) return 'en'
+  const sample = text.slice(0, 200)
+  return ARABIC_RE.test(sample) ? 'ar' : 'en'
+}
 
 const NO_ANSWER_PATTERNS = [
   "i'm sorry. i'm unable to help",
@@ -142,9 +153,20 @@ function MessageBubble({ message, onSendQuestion, onRetry, isBusy }) {
   const [feedback, setFeedback] = useState(message.feedback || null)
   const [submitting, setSubmitting] = useState(false)
   const [lang, setLang] = useState(getLanguage())
+  const [translated, setTranslated] = useState(null)
+  const [showingTranslated, setShowingTranslated] = useState(false)
+  const [translating, setTranslating] = useState(false)
+  const [translateError, setTranslateError] = useState(null)
   const isUser = message.role === 'user'
-  const sections = useMemo(() => splitSections(message.content), [message.content])
-  const noAnswer = useMemo(() => isNoAnswer(message.content), [message.content])
+
+  const sourceLang = useMemo(() => detectLang(message.content), [message.content])
+  const targetLang = sourceLang === 'ar' ? 'en' : 'ar'
+
+  const renderedContent = showingTranslated && translated ? translated : message.content
+  const renderedDir = showingTranslated ? (targetLang === 'ar' ? 'rtl' : 'ltr') : undefined
+
+  const sections = useMemo(() => splitSections(renderedContent), [renderedContent])
+  const noAnswer = useMemo(() => isNoAnswer(renderedContent), [renderedContent])
 
   useEffect(() => {
     const h = (e) => setLang(e.detail)
@@ -164,6 +186,37 @@ function MessageBubble({ message, onSendQuestion, onRetry, isBusy }) {
       setSubmitting(false)
     }
   }
+
+  const handleTranslate = async () => {
+    setTranslateError(null)
+    // If we already have a translation cached, toggle without a network call.
+    if (translated) {
+      setShowingTranslated((v) => !v)
+      return
+    }
+    const sessionToken = localStorage.getItem(SESSION_KEY)
+    if (!sessionToken || !message.content) return
+    setTranslating(true)
+    try {
+      const { data } = await translateMessage(sessionToken, message.content, targetLang)
+      setTranslated(data.translated_text)
+      setShowingTranslated(true)
+    } catch (e) {
+      setTranslateError(
+        e?.response?.data?.detail || t('translate_failed', lang),
+      )
+    } finally {
+      setTranslating(false)
+    }
+  }
+
+  const translateLabel = translating
+    ? t('translating', lang)
+    : showingTranslated
+      ? t('show_original', lang)
+      : targetLang === 'ar'
+        ? t('translate_to_ar', lang)
+        : t('translate_to_en', lang)
 
   if (isUser) {
     return (
@@ -219,59 +272,61 @@ function MessageBubble({ message, onSendQuestion, onRetry, isBusy }) {
             {t('stopped', lang)}
           </div>
         )}
-        {noAnswer ? (
-          <NoAnswerCard />
-        ) : sections ? (
-          <>
-            {sections.kb && (
-              <Section
-                accent="bg-brand-50 border-brand-100"
-                title={t('section_kb', lang)}
-                icon="📚"
-              >
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {sections.kb}
-                </ReactMarkdown>
-              </Section>
-            )}
-            {sections.extra && (
-              <Section
-                accent="bg-amber-50 border-amber-100"
-                title={t('section_extra', lang)}
-                icon="💡"
-                dim
-              >
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {sections.extra}
-                </ReactMarkdown>
-              </Section>
-            )}
-            {/* Legacy: render Key Takeaway only if present in older saved messages */}
-            {sections.key && (
-              <Section
-                accent="bg-green-50 border-green-100"
-                title={t('section_key', lang)}
-                icon="🎯"
-              >
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {sections.key}
-                </ReactMarkdown>
-              </Section>
-            )}
-            <FollowUps
-              questions={sections.followups}
-              onSelect={onSendQuestion}
-              disabled={isBusy}
-              title={t('section_followups', lang)}
-            />
-          </>
-        ) : (
-          <div className="markdown text-gray-800">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {message.content || ''}
-            </ReactMarkdown>
-          </div>
-        )}
+        <div dir={renderedDir}>
+          {noAnswer ? (
+            <NoAnswerCard />
+          ) : sections ? (
+            <>
+              {sections.kb && (
+                <Section
+                  accent="bg-brand-50 border-brand-100"
+                  title={t('section_kb', lang)}
+                  icon="📚"
+                >
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {sections.kb}
+                  </ReactMarkdown>
+                </Section>
+              )}
+              {sections.extra && (
+                <Section
+                  accent="bg-amber-50 border-amber-100"
+                  title={t('section_extra', lang)}
+                  icon="💡"
+                  dim
+                >
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {sections.extra}
+                  </ReactMarkdown>
+                </Section>
+              )}
+              {/* Legacy: render Key Takeaway only if present in older saved messages */}
+              {sections.key && (
+                <Section
+                  accent="bg-green-50 border-green-100"
+                  title={t('section_key', lang)}
+                  icon="🎯"
+                >
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {sections.key}
+                  </ReactMarkdown>
+                </Section>
+              )}
+              <FollowUps
+                questions={sections.followups}
+                onSelect={onSendQuestion}
+                disabled={isBusy}
+                title={t('section_followups', lang)}
+              />
+            </>
+          ) : (
+            <div className="markdown text-gray-800">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {renderedContent || ''}
+              </ReactMarkdown>
+            </div>
+          )}
+        </div>
 
         {!message.error && message.documentsReferenced?.length > 0 && (
           <div className="mt-3 pt-2 border-t border-gray-100">
@@ -297,7 +352,7 @@ function MessageBubble({ message, onSendQuestion, onRetry, isBusy }) {
         )}
 
         {!message.streaming && message.historyId && !message.error && (
-          <div className="mt-3 flex items-center gap-2 text-xs">
+          <div className="mt-3 flex items-center flex-wrap gap-2 text-xs">
             <button
               type="button"
               onClick={() => submit('helpful')}
@@ -324,6 +379,22 @@ function MessageBubble({ message, onSendQuestion, onRetry, isBusy }) {
             >
               👎 Not Helpful
             </button>
+            <button
+              type="button"
+              onClick={handleTranslate}
+              disabled={translating}
+              className={`px-2 py-1 rounded border transition ${
+                showingTranslated
+                  ? 'bg-brand-50 border-brand-400 text-brand-700'
+                  : 'border-gray-200 text-gray-500 hover:bg-gray-50'
+              } disabled:opacity-60 disabled:cursor-wait`}
+              aria-label={translateLabel}
+            >
+              🌐 {translateLabel}
+            </button>
+            {translateError && (
+              <span className="text-red-600 ms-1">{translateError}</span>
+            )}
           </div>
         )}
       </div>

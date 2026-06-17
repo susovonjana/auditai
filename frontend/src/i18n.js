@@ -46,6 +46,11 @@ const STRINGS = {
     stop: 'Stop generating',
     stopped: 'Generation stopped.',
     retry: 'Try again',
+    translate_to_ar: 'Translate to Arabic',
+    translate_to_en: 'Translate to English',
+    show_original: 'Show original',
+    translating: 'Translating…',
+    translate_failed: 'Translation failed. Please try again.',
   },
   ar: {
     app_title: 'مساعد AuditAI',
@@ -69,6 +74,11 @@ const STRINGS = {
     stop: 'إيقاف التوليد',
     stopped: 'تم إيقاف التوليد.',
     retry: 'إعادة المحاولة',
+    translate_to_ar: 'ترجم إلى العربية',
+    translate_to_en: 'ترجم إلى الإنجليزية',
+    show_original: 'إظهار الأصلي',
+    translating: 'جارٍ الترجمة…',
+    translate_failed: 'فشلت الترجمة. يرجى المحاولة مرة أخرى.',
   },
 }
 

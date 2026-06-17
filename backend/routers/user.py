@@ -31,6 +31,7 @@ from config import (
     MAX_QUESTIONS_PER_SESSION_DAY,
     RATE_LIMIT_ASK,
     RATE_LIMIT_SESSION_START,
+    RATE_LIMIT_TRANSLATE,
 )
 from cache import answer_cache
 from database import AsyncSessionLocal, get_db
@@ -423,6 +424,46 @@ async def feedback(
 
 
 # ---------------------------------------------------------------------------
+# Translate (EN ↔ AR) — translates an arbitrary chunk of text. Used by the
+# chat UI's "Translate" button under each AI response.
+# ---------------------------------------------------------------------------
+@router.post("/translate", response_model=schemas.TranslateResponse)
+@limiter.limit(RATE_LIMIT_TRANSLATE)
+async def translate(
+    request: Request,
+    payload: schemas.TranslateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    await _load_session(db, payload.session_token)
+    started = time.perf_counter()
+    try:
+        translated = await qa.translate_text(payload.text, payload.target_language)
+    except RuntimeError as exc:
+        logger.exception("Translate config error: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Translation is temporarily unavailable. Please try again.",
+        )
+    except Exception as exc:
+        logger.exception("Translate failure: %s", exc)
+        if qa.is_quota_error(exc):
+            raise HTTPException(
+                status_code=429,
+                detail="Translation is temporarily at capacity. Please try again in a minute.",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail="There was a problem translating that response. Please try again.",
+        )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return schemas.TranslateResponse(
+        translated_text=translated,
+        target_language=payload.target_language,
+        response_time_ms=elapsed_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Session history
 # ---------------------------------------------------------------------------
 @router.get(
@@ -441,7 +482,7 @@ async def session_history(
             .order_by(SearchHistory.asked_at.asc())
         )
     ).scalars().all()
-    return list(rows)
+    return [schemas.SearchHistoryItem.model_validate(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------

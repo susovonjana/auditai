@@ -168,6 +168,21 @@ class FeedbackRequest(BaseModel):
 
 
 # =========================================================================
+# Translation
+# =========================================================================
+class TranslateRequest(BaseModel):
+    session_token: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1, max_length=10000)
+    target_language: str = Field(..., pattern="^(en|ar)$")
+
+
+class TranslateResponse(BaseModel):
+    translated_text: str
+    target_language: str
+    response_time_ms: int
+
+
+# =========================================================================
 # Search history
 # =========================================================================
 class SearchHistoryItem(BaseModel):
