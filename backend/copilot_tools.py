@@ -142,7 +142,14 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
 TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         name="get_audit_file_summary",
-        description="Client, sector, period and currency of THIS audit file.",
+        description=(
+            "THIS audit file's profile and key dates: file name, client, sector, "
+            "reporting currency, status, the audit period and its start/end dates "
+            "(plus the prior-year period), field-work start date, engagement date "
+            "and the DUE DATE. Use this for ANY question about this file's "
+            "metadata, deadlines or dates (e.g. 'period end date of this file', "
+            "'what is the due date of this file')."
+        ),
         parameters={"type": "object", "properties": {}},
     ),
     ToolSpec(
@@ -291,29 +298,54 @@ SYSTEM_FILE_ANSWER = (
     "1audit product-help questions.\n\n"
     "DECIDE THE SOURCE BEFORE CALLING ANY TOOL:\n"
     "1. ABOUT THIS FILE — its figures, balances, accounts, trial balance, "
-    "financial statements, working papers, risks, sampling or audit areas — use "
-    "the FILE tools: get_audit_file_summary, get_trial_balance, "
-    "get_financial_statement, list_working_papers + get_working_paper, get_risks, "
-    "get_audit_area, get_procedure_results. (If unsure which working paper holds "
-    "something, call list_working_papers first.)\n"
+    "financial statements, working papers, risks, sampling or audit areas, OR its "
+    "profile / metadata (client, sector, currency, status, the audit period and "
+    "ANY date such as the period start/end, field-work start, engagement date or "
+    "DUE DATE) — use the FILE tools: get_audit_file_summary (for the file's "
+    "profile, dates and due date), get_trial_balance, get_financial_statement, "
+    "list_working_papers + get_working_paper, get_risks, get_audit_area, "
+    "get_procedure_results. Any question phrased as '… of this file' or \"this "
+    "file's …\" is about THIS file — answer it from these tools, never from "
+    "search_standards. (If unsure which working paper holds something, call "
+    "list_working_papers first.)\n"
     "2. GENERAL — a definition or concept (e.g. 'what is a branch?'), what a "
     "standard requires (e.g. 'what does ISA 315 say?'), or how to use 1audit "
     "(e.g. 'how do I add a working paper?') — call search_standards. NEVER call "
     "the file tools for these; they hold only this file's data and would waste "
     "effort and find nothing. A general question is NOT a reason to read the "
     "file.\n\n"
-    "GROUNDING: Answer only from tool results. Never invent figures, names, dates "
-    "or conclusions about this file — every file number must come from a file "
-    "tool. For general questions, prefer the search_standards passages and cite "
-    "the source document; if nothing relevant is returned and it is a pure "
-    "concept, you may answer briefly from general audit knowledge, but never "
-    "fabricate file-specific facts.\n\n"
+    "GROUNDING — STRICT: Before you state ANY fact about this file (a figure, "
+    "balance, account, name, date, currency, status or conclusion) you MUST have "
+    "called a file tool that returned it. If you have not called the right tool "
+    "yet, call it now — do NOT answer a file question from memory, assumption or "
+    "a typical value. If the tool returns an error or has no value for what was "
+    "asked, say plainly you could not retrieve it (and, if useful, where it is "
+    "set) — NEVER guess or invent a value. Every file-specific number, name and "
+    "date in your answer must trace to a tool result. For general questions, "
+    "prefer the search_standards passages and cite the source document; if "
+    "nothing relevant is returned and it is a pure concept, you may answer "
+    "briefly from general audit knowledge, but never fabricate file-specific "
+    "facts.\n\n"
     "OUTPUT FORMAT — your FINAL reply must be Markdown with these two sections, "
     "and keep BOTH headers exactly in English even when you answer in another "
     "language:\n"
     "## Answer\n"
-    "The answer, concise; briefly cite what you used (e.g. 'from the income "
-    "statement' or 'per ISA 315').\n\n"
+    "Lead with the direct answer, formatted for easy reading:\n"
+    "- Do NOT narrate your process or internal steps (no 'let me check…', 'I "
+    "need to access the summary…', 'based on the documentation') and do not "
+    "mention tools — just give the answer.\n"
+    "- **Bold the key figures, dates and values.** For money, include the "
+    "currency and clearly label current year vs prior year.\n"
+    "- Use a short '- ' bullet list when there are several values, accounts or "
+    "rows; keep a single value inline in a sentence.\n"
+    "- ADAPT THE DEPTH to the question: for a simple lookup (one date, name, "
+    "status or figure) keep it tight — just the value and its source, no "
+    "padding. For an ANALYTICAL question (a variance, trend, comparison, "
+    "materiality, or 'is this significant') add ONE short line of grounded "
+    "interpretation drawn from the figures — the size and direction of a change "
+    "and why it may matter — but never speculate beyond what the numbers show.\n"
+    "- End by briefly citing what you used (e.g. 'from the trial balance', 'per "
+    "the income statement', or 'per ISA 315').\n\n"
     "## Follow-up Questions\n"
     "Up to three short questions the user is likely to ask next, as a '- ' "
     "bullet list. EACH must be answerable from THIS file's tools or the standards "
@@ -344,7 +376,12 @@ def answer_about_file(
     specs = TOOL_SPECS + [STANDARDS_TOOL_SPEC] if kb_search else TOOL_SPECS
     lang_name = "Arabic" if language == "ar" else "English"
     user = f"Question: {question}\n\nAnswer in {lang_name}."
-    return run_tool_loop(SYSTEM_FILE_ANSWER, user, specs, impls, max_steps=6)
+    # force_first_call: a question only reaches this loop when it needs THIS
+    # file's data, so make the model fetch with a tool before it may answer —
+    # never let it guess a figure/date or just say it will look it up.
+    return run_tool_loop(
+        SYSTEM_FILE_ANSWER, user, specs, impls, max_steps=6, force_first_call=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,13 +398,25 @@ class _IntentResult(BaseModel):
 
 _INTENT_SYSTEM = (
     "You route a user's question asked inside an audit file's chat. Decide "
-    "whether answering it REQUIRES this specific audit file's own data — its "
-    "figures, account balances, trial balance, financial-statement amounts, a "
-    "working paper's recorded answers, assessed risks, or sampling/exception "
-    "results. Set needs_file_data=true ONLY then. Set it false for general "
-    "questions: a definition or concept (e.g. 'what is a balance sheet?'), what "
-    "an auditing standard requires, or how to use the 1audit product (e.g. 'how "
-    "do I add a working paper?')."
+    "whether answering it REQUIRES this specific audit file's own data.\n"
+    "Set needs_file_data=TRUE when the question asks for anything that belongs to "
+    "THIS file, including:\n"
+    "- its FIGURES: account balances, trial balance, financial-statement amounts, "
+    "a working paper's recorded answers, assessed risks, sampling/exception "
+    "results; and\n"
+    "- its METADATA / PROFILE: the client or entity name, sector, reporting "
+    "currency, the audit period, ANY date (period start/end, prior-year period, "
+    "field-work start, engagement date, DUE DATE / deadline), the file's status "
+    "or progress, or whether it is consolidated.\n"
+    "A strong signal is wording that points at the current file — 'this file', "
+    "'this audit', 'this engagement', 'of this file', \"the file's …\" — or asking "
+    "for the VALUE of a property (what IS the period end date / due date / client "
+    "/ currency of this file). Those are needs_file_data=TRUE.\n"
+    "Set needs_file_data=FALSE only for GENERAL questions that are not about this "
+    "file's own value: a definition or concept ('what is a balance sheet?', 'what "
+    "does a due date mean?'), what an auditing standard requires, or how to USE "
+    "the 1audit product ('how do I set the due date?', 'how do I add a working "
+    "paper?'). When in doubt, prefer TRUE."
 )
 
 
@@ -417,7 +466,7 @@ RESPONSE_SYSTEM_PROMPT = (
     "If the tools do not contain the answer, say so plainly.\n"
     "Output ONLY clean semantic HTML (<p>, <ul>, <ol>, <li>, <strong>, <em>) — "
     "no markdown, no code fences, no preamble. Be concise. End with a brief "
-    "italic note that this is an AI-assisted draft for auditor review."
+    "italic note that this is an AI-generated."
 )
 
 
@@ -439,4 +488,6 @@ def respond_to_procedure(
         f"Draft the auditor's response to this procedure in {lang_name}, using "
         f"the file's real data."
     )
-    return run_tool_loop(RESPONSE_SYSTEM_PROMPT, user, TOOL_SPECS, impls, max_steps=6)
+    return run_tool_loop(
+        RESPONSE_SYSTEM_PROMPT, user, TOOL_SPECS, impls, max_steps=6, force_first_call=True
+    )

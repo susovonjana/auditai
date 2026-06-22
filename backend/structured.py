@@ -263,9 +263,17 @@ def _run_tool_loop_once(
     max_steps: int,
     temperature: float,
     max_output_tokens: int,
+    force_first_call: bool = False,
 ) -> ToolLoopResult:
     """One full function-calling conversation on a single model. Raises on
-    quota/other errors (the caller decides whether to fail over)."""
+    quota/other errors (the caller decides whether to fail over).
+
+    When ``force_first_call`` is set and tools are available, the FIRST turn is
+    sent with function-calling mode ANY, so the model MUST call a tool before it
+    may answer. This stops models from answering a data question from assumption
+    (e.g. guessing a date) or merely narrating "I will look it up" without
+    actually calling the tool. Once the first tool result is fed back, the loop
+    reverts to AUTO so the model can finalise with text or call more tools."""
     import google.generativeai as genai
 
     fn_decls = [
@@ -285,7 +293,14 @@ def _run_tool_loop_once(
         generation_config=generation_config,
     )
     chat = model.start_chat()
-    response = chat.send_message(user)
+    # Force a tool call on the opening turn (mode ANY) when asked to; subsequent
+    # turns use the model's default AUTO mode so it can produce the final answer.
+    if force_first_call and sdk_tools:
+        response = chat.send_message(
+            user, tool_config={"function_calling_config": {"mode": "ANY"}}
+        )
+    else:
+        response = chat.send_message(user)
     tools_used: List[ToolCall] = []
 
     for _step in range(max_steps):
@@ -329,6 +344,7 @@ def run_tool_loop(
     *,
     temperature: float = 0.0,
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    force_first_call: bool = False,
 ) -> ToolLoopResult:
     """Run a function-calling conversation until the model returns a final text
     answer (or ``max_steps`` is reached).
@@ -354,6 +370,7 @@ def run_tool_loop(
             result = _run_tool_loop_once(
                 model_name, system, user, tools, tool_impls,
                 max_steps, temperature, max_output_tokens,
+                force_first_call=force_first_call,
             )
         except Exception as exc:
             if is_quota_error(exc):
