@@ -135,8 +135,8 @@ async def _persist_ask_history(
     question: str,
     result: "qa.QAResult",
     elapsed_ms: int,
-    user_id: str | None = None,
-    organization_id: str | None = None,
+    user_id: Optional[str] = None,
+    organization_id: Optional[str] = None,
 ) -> None:
     """Write the SearchHistory row + bump session counters AFTER the response
     has been sent. Uses a fresh AsyncSession because the request-scoped one
@@ -351,7 +351,7 @@ async def ask_stream(
 
         # Persist to search_history in a fresh session — the original `db`
         # session is bound to the HTTP request and may be closing.
-        history_id: str | None = None
+        history_id: Optional[str] = None
         try:
             async with AsyncSessionLocal() as bg:
                 history = SearchHistory(

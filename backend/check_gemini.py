@@ -5,9 +5,17 @@ Run from the backend folder with venv active:
     python check_gemini.py
 """
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Mirror config.py env loading: APP_ENV=local -> .env.local, etc.
+# Falls back to .env. This lets `APP_ENV=local python check_gemini.py` work
+# in repos that only ship .env.local / .env.production (no plain .env).
+_BASE_DIR = Path(__file__).resolve().parent
+_env_name = os.getenv("APP_ENV", "").strip().lower()
+if _env_name:
+    load_dotenv(_BASE_DIR / f".env.{_env_name}")
+load_dotenv()  # .env fallback; does not override already-set vars
 
 key = os.getenv("GEMINI_API_KEY", "")
 if not key:

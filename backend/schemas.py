@@ -168,6 +168,81 @@ class FeedbackRequest(BaseModel):
 
 
 # =========================================================================
+# Copilot — procedure generation (ticket A-1)
+# =========================================================================
+class ProcedureRiskItem(BaseModel):
+    """One linked risk the procedure should respond to."""
+    title: Optional[str] = Field(None, max_length=1000)
+    description: Optional[str] = Field(None, max_length=8000)
+    assessment_level: Optional[str] = Field(None, max_length=64)
+
+
+class ProcedureRequest(BaseModel):
+    session_token: str
+    section_title: Optional[str] = Field(None, max_length=512)
+    risks: List[ProcedureRiskItem] = Field(default_factory=list, max_length=20)
+    assertions: List[str] = Field(default_factory=list, max_length=40)
+    client_sector: Optional[str] = Field(None, max_length=256)
+    audit_area: Optional[str] = Field(None, max_length=256)
+    language: str = Field("en", pattern="^(en|ar)$")
+    # Optional caller identity (1audit embed). Accepts int or str.
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+# =========================================================================
+# Copilot — AI draft findings (ticket A-6)
+# =========================================================================
+class ProcedureFindingsRequest(BaseModel):
+    session_token: str
+    audit_file_id: int
+    copilot_grant: str
+    # The procedure text the auditor is responding to (HTML or plain).
+    procedure: Optional[str] = Field(None, max_length=20000)
+    # Optional linkage to narrow which account's results to read.
+    account: Optional[str] = Field(None, max_length=256)
+    coa_original_id: Optional[int] = None
+    assertions: List[str] = Field(default_factory=list, max_length=40)
+    language: str = Field("en", pattern="^(en|ar)$")
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_findings_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+# =========================================================================
+# Copilot — file-grounded chat (B-3)
+# =========================================================================
+class CopilotChatRequest(BaseModel):
+    session_token: str
+    audit_file_id: int
+    copilot_grant: str
+    question: str = Field(..., min_length=1, max_length=4000)
+    language: str = Field("en", pattern="^(en|ar)$")
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_chat_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+# =========================================================================
 # Translation
 # =========================================================================
 class TranslateRequest(BaseModel):

@@ -3,8 +3,8 @@ Central configuration loader.
 Reads environment variables from .env and exposes them as constants.
 
 FREE STACK:
-  - LLM:        Google Gemini API (gemini-1.5-flash, free tier)
-  - Embeddings: sentence-transformers locally (all-MiniLM-L6-v2, 384-dim)
+  - LLM:        Google Gemini API (gemini-flash-latest, with model failover)
+  - Embeddings: sentence-transformers locally (bge-small-en-v1.5, 384-dim)
 """
 import os
 from pathlib import Path
@@ -17,7 +17,11 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 _env_name = os.getenv("APP_ENV", "").strip().lower()
 _env_file = BASE_DIR / (f".env.{_env_name}" if _env_name else ".env")
-load_dotenv(_env_file)
+# override=True: the deployed .env is the runtime source of truth, so it wins
+# over any stale value already in the process environment (e.g. a key baked in
+# via `docker run -e GEMINI_API_KEY=…`). Without this, editing .env and
+# restarting would silently keep using the old baked value.
+load_dotenv(_env_file, override=True)
 
 # --- AI provider keys ---
 # Only Gemini is required in the free stack
@@ -55,6 +59,17 @@ ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin")
 # --- CORS ---
 FRONTEND_ORIGIN: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
+# --- 1audit integration (copilot data callbacks) ---
+# Base URL of 1audit-be's internal copilot API. The copilot tools HTTP-GET
+# {ONEAUDIT_BASE_URL}/copilot/audit_files/{id}/... presenting an X-Copilot-Grant
+# header. In Docker, reach the host's 1audit-be via host.docker.internal.
+ONEAUDIT_BASE_URL: str = os.getenv(
+    "ONEAUDIT_BASE_URL", "http://localhost:5030/api/v1/internal"
+)
+# Timeout (seconds) for copilot data callbacks to 1audit-be. Some read services
+# (e.g. a lead-sheet-heavy working paper's content) take ~20s, so allow headroom.
+ONEAUDIT_HTTP_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_TIMEOUT", "45"))
+
 # --- Uploads ---
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
 MAX_FILE_SIZE_BYTES: int = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -66,9 +81,14 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # Gemini (LLM). Comma-separated list of model names for failover when one
 # model hits its per-day free-tier quota. Tried in order; left-most first.
 # A single value (no comma) keeps the original single-model behaviour.
-GEMINI_MODEL_RAW: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+# NOTE: gemini-2.0-flash was retired by Google (2026-06-01). Default to the
+# resilient `gemini-flash-latest` alias (always points at the current flash
+# model) with versioned fallbacks. Override via the GEMINI_MODEL env var.
+GEMINI_MODEL_RAW: str = os.getenv(
+    "GEMINI_MODEL", "gemini-flash-latest,gemini-2.5-flash,gemini-2.5-flash-lite"
+)
 GEMINI_MODELS: list[str] = [m.strip() for m in GEMINI_MODEL_RAW.split(",") if m.strip()] or [
-    "gemini-2.0-flash"
+    "gemini-flash-latest"
 ]
 # Kept for callers that still import the original constant; points at the
 # primary (left-most) model.
