@@ -20,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     BigInteger,
+    Index,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -214,4 +215,82 @@ class AdminUser(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Table 6: proc_memory  (ticket A-1b — firm "house style" procedure memory)
+# ---------------------------------------------------------------------------
+class ProcMemory(Base):
+    """An accepted audit procedure, embedded by (audit_area + risk_summary) so a
+    future draft can retrieve THIS firm's closest past procedures as few-shot
+    examples and increasingly match their house style.
+
+    Strictly org-scoped and purely additive: rows live only in auditai's own
+    Postgres, are never read or written by 1audit, and are only appended to (no
+    update/delete in app code)."""
+    __tablename__ = "proc_memory"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, index=True
+    )
+    client_sector: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    audit_area: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    risk_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    assertions: Mapped[Any] = mapped_column(JSONB, nullable=False, default=list)
+    procedure_html: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Any] = mapped_column(
+        Vector(EMBEDDING_DIMENSIONS), nullable=False
+    )
+    confirmed_by: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confirmed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
+class TbMappingMemory(Base):
+    """A confirmed trial-balance account -> chart-of-account decision, embedded by
+    its normalised account text so a future "AI auto map" run can retrieve the
+    firm's closest past mappings (ticket C-2).
+
+    This is the learning store behind both signals the feature uses:
+      * "previous data"  — this client's own prior confirmed mappings.
+      * "organization trend" — the whole firm's confirmed mappings (same org),
+        preferring the same client sector.
+    A reserved organization_id may also hold a curated "prime"/golden seed so a
+    brand-new org/client still gets suggestions on day one (cold start).
+
+    Strictly org-scoped and purely additive: rows live only in auditai's own
+    Postgres, are never read or written by 1audit, and are only appended to (no
+    update/delete in app code)."""
+    __tablename__ = "tb_mapping_memory"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # Mandatory retrieval scope. A reserved id (the "prime" seed) is also stored
+    # here, so cold-start lookups reuse the exact same search path.
+    organization_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    client_sector: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The normalised "name (+ second language) + code" text we embed and match on.
+    account_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Raw account code, kept verbatim for exact-code lookups and the btree index.
+    account_code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The confirmed mapping target (1audit ChartOfAccount.id).
+    coa_original_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    coa_label: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    embedding: Mapped[Any] = mapped_column(
+        Vector(EMBEDDING_DIMENSIONS), nullable=False
+    )
+    confirmed_by: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confirmed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        # Fast exact/near lookups by code within an org (Tier-1 "previous data").
+        Index("tb_mapping_memory_org_code_idx", "organization_id", "account_code"),
     )

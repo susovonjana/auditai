@@ -8,6 +8,7 @@ FREE STACK:
 """
 import os
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # Load env file based on APP_ENV.
@@ -69,6 +70,42 @@ ONEAUDIT_BASE_URL: str = os.getenv(
 # Timeout (seconds) for copilot data callbacks to 1audit-be. Some read services
 # (e.g. a lead-sheet-heavy working paper's content) take ~20s, so allow headroom.
 ONEAUDIT_HTTP_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_TIMEOUT", "45"))
+
+# Short-TTL cache for the file-mode chat's data fetches. Within this window a
+# repeated tool call (same file + endpoint + args) is served from memory instead
+# of re-querying 1audit-be, so a burst of questions doesn't re-fetch the same
+# trial balance / summary each time. The grant is still re-validated once per
+# chat request, so caching never bypasses authorization. Set to 0 to disable.
+COPILOT_DATA_CACHE_TTL_SEC: int = int(os.getenv("COPILOT_DATA_CACHE_TTL_SEC", "120"))
+
+# TTL for caching the Tier-3 LLM mapping picks in tb_mapping_engine, so re-running
+# "AI auto map" over the same accounts (re-clicks, re-maps) doesn't re-spend the
+# scarce Gemini quota — the deterministic Tiers 1/2 still recompute every call.
+# Keyed by account content + candidate shortlist, so it's safe across requests.
+# Set to 0 to disable.
+COPILOT_TB_LLM_CACHE_TTL_SEC: int = int(os.getenv("COPILOT_TB_LLM_CACHE_TTL_SEC", "3600"))
+
+# Large-dataset guards for the Tier-3 LLM tail. The deterministic Tiers 1/2 are
+# fast; Gemini is the slow, quota-bound part. On a big trial balance the low-conf
+# tail can be hundreds of accounts — without these it would fire dozens of
+# sequential Gemini calls (slow + quota) and a single slow response would hang the
+# whole request. Cap how many accounts reach Gemini per request (0 = unlimited,
+# for a billing-enabled key) and bound each sub-batch call's wall-clock so it
+# degrades to Tier-2 instead of hanging.
+COPILOT_TB_LLM_TAIL_MAX: int = int(os.getenv("COPILOT_TB_LLM_TAIL_MAX", "45"))
+COPILOT_TB_LLM_TIMEOUT_SEC: int = int(os.getenv("COPILOT_TB_LLM_TIMEOUT_SEC", "20"))
+# How many LLM sub-batches may be in flight at once. 1 = sequential (safe for the
+# free-tier key, whose low rate limit would 429 on concurrent calls). On a paid
+# key raise this (e.g. 5) so a large tail resolves in parallel — roughly the time
+# of one call instead of N. Pair with COPILOT_TB_LLM_TAIL_MAX=0 to LLM the whole tail.
+COPILOT_TB_LLM_CONCURRENCY: int = int(os.getenv("COPILOT_TB_LLM_CONCURRENCY", "1"))
+
+# Reserved "prime" organization id holding a curated golden TB-mapping seed in
+# tb_mapping_memory (ticket C-2/C-3). When a brand-new org/client has no history
+# of its own, the auto-map engine falls back to this seed via the SAME search
+# path. The 1audit-be bridge usually passes prime_org_id explicitly; this is the
+# default. Empty = no cold-start seed (Tier-2 then relies on candidate labels).
+COPILOT_PRIME_MEMORY_ORG_ID: Optional[str] = os.getenv("COPILOT_PRIME_MEMORY_ORG_ID") or None
 
 # --- Uploads ---
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "25"))

@@ -198,6 +198,31 @@ class ProcedureRequest(BaseModel):
 
 
 # =========================================================================
+# Copilot — procedure "house style" memory (ticket A-1b)
+# =========================================================================
+class ProcedureConfirmRequest(BaseModel):
+    """Sent when an auditor SAVES an AI-assisted procedure, so its text becomes a
+    future few-shot example for this organization (proc_memory). Org-scoped."""
+    session_token: str
+    section_title: Optional[str] = Field(None, max_length=512)
+    audit_area: Optional[str] = Field(None, max_length=256)
+    client_sector: Optional[str] = Field(None, max_length=256)
+    risks: List[ProcedureRiskItem] = Field(default_factory=list, max_length=20)
+    assertions: List[str] = Field(default_factory=list, max_length=40)
+    procedure_html: str = Field(..., min_length=1, max_length=20000)
+    language: str = Field("en", pattern="^(en|ar)$")
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_confirm_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+# =========================================================================
 # Copilot — AI draft findings (ticket A-6)
 # =========================================================================
 class ProcedureFindingsRequest(BaseModel):
@@ -237,6 +262,88 @@ class CopilotChatRequest(BaseModel):
     @field_validator("user_id", "organization_id", mode="before")
     @classmethod
     def _stringify_chat_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+# =========================================================================
+# Copilot — TB auto-mapping (ticket C-3)
+# =========================================================================
+class TbAccountIn(BaseModel):
+    tb_account_id: int
+    account_name: Optional[str] = Field(None, max_length=512)
+    account_name_sl: Optional[str] = Field(None, max_length=512)
+    account_code: Optional[str] = Field(None, max_length=64)
+    cy_amount: Optional[float] = None
+
+
+class CoaCandidateIn(BaseModel):
+    coa_original_id: int
+    label: Optional[str] = Field(None, max_length=512)
+    group: Optional[str] = Field(None, max_length=256)
+    type: Optional[str] = Field(None, max_length=256)
+
+
+class PriorMappingIn(BaseModel):
+    account_name: Optional[str] = Field(None, max_length=512)
+    account_name_sl: Optional[str] = Field(None, max_length=512)
+    account_code: Optional[str] = Field(None, max_length=64)
+    coa_original_id: int
+    coa_label: Optional[str] = Field(None, max_length=512)
+
+
+class TbMappingRequest(BaseModel):
+    """Suggest a COA per unmapped TB account. The 1audit-be bridge gathers the
+    unmapped accounts, the file's candidate COA set, and (when available) this
+    client's prior-year confirmed mappings, and posts them here."""
+    # Optional: this is a trusted be->auditai call (be already authorized via
+    # route permissions). Forwarded for rate-limit scoping when the FE has a
+    # copilot session open; otherwise the call still proceeds.
+    session_token: Optional[str] = None
+    audit_file_id: Optional[int] = None
+    copilot_grant: Optional[str] = None
+    organization_id: Optional[str] = None
+    client_sector: Optional[str] = Field(None, max_length=256)
+    prime_org_id: Optional[str] = None
+    accounts: List[TbAccountIn] = Field(..., min_length=1, max_length=3000)
+    coa: List[CoaCandidateIn] = Field(default_factory=list, max_length=8000)
+    prior_mappings: List[PriorMappingIn] = Field(default_factory=list, max_length=8000)
+    language: str = Field("en", pattern="^(en|ar)$")
+    # Tier-3 LLM tail is OFF by default — Tiers 1 & 2 are fully deterministic and
+    # need no Gemini quota. The bridge flips this on when quota is available.
+    use_llm_tail: bool = False
+    user_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", "prime_org_id", mode="before")
+    @classmethod
+    def _stringify_tbmap_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+class TbMappingFeedbackItem(BaseModel):
+    account_name: Optional[str] = Field(None, max_length=512)
+    account_name_sl: Optional[str] = Field(None, max_length=512)
+    account_code: Optional[str] = Field(None, max_length=64)
+    coa_original_id: int
+    coa_label: Optional[str] = Field(None, max_length=512)
+
+
+class TbMappingFeedbackRequest(BaseModel):
+    """A confirmed TB mapping (AI-accepted OR manual) posted by 1audit-be so it is
+    appended to tb_mapping_memory and becomes a Tier-1 hit next time (ticket C-6).
+    Best-effort: the route never raises to the caller."""
+    session_token: Optional[str] = None
+    organization_id: Optional[str] = None
+    client_sector: Optional[str] = Field(None, max_length=256)
+    confirmed_by: Optional[str] = None
+    items: List[TbMappingFeedbackItem] = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("organization_id", "confirmed_by", mode="before")
+    @classmethod
+    def _stringify_fb_ids(cls, v):
         if v is None or v == "":
             return None
         return str(v)

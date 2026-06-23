@@ -14,6 +14,8 @@ _MAX_RISKS = 8
 _MAX_ASSERTIONS = 20
 _MAX_CHUNKS = 8
 _MAX_CHUNK_CHARS = 1200
+_MAX_EXAMPLES = 3          # firm "house style" examples (ticket A-1b)
+_MAX_EXAMPLE_CHARS = 1500
 
 _LANG_NAME = {"en": "English", "ar": "Arabic"}
 
@@ -52,13 +54,15 @@ def build_user_prompt(
     assertions: List[str],
     risks: List[dict],
     retrieved_chunks: List[str],
+    examples: Optional[List[str]] = None,
     language: str = "en",
 ) -> str:
     """Assemble the USER prompt from the section context + retrieved KB guidance.
 
     ``risks`` is a list of dicts with optional ``title`` / ``description`` /
     ``assessment_level`` keys. ``retrieved_chunks`` are raw standard-guidance
-    passages pulled from the knowledge base.
+    passages pulled from the knowledge base. ``examples`` are the firm's own
+    closest past procedures (ticket A-1b), shown so output matches house style.
     """
     area = _clean(audit_area) or _clean(section_title) or "the audit area"
     sector = _clean(client_sector) or "not specified"
@@ -92,6 +96,21 @@ def build_user_prompt(
         else "(no specific standard guidance retrieved — rely on general audit best practice)"
     )
 
+    example_parts: List[str] = []
+    for ex in (examples or [])[:_MAX_EXAMPLES]:
+        e = _clean(ex)
+        if e:
+            example_parts.append(e[:_MAX_EXAMPLE_CHARS])
+    examples_text = ""
+    if example_parts:
+        joined = "\n\n---\n\n".join(example_parts)
+        examples_text = (
+            "Examples of how THIS firm writes such procedures (match their style, "
+            "structure and level of detail — but tailor the steps to the risk(s) "
+            "above and never copy any client figures):\n"
+            f"{joined}\n\n"
+        )
+
     section_line = f"Section / work area: {_clean(section_title)}\n" if _clean(section_title) else ""
 
     return (
@@ -101,6 +120,7 @@ def build_user_prompt(
         f"Assertions to address: {assertions_text}\n\n"
         f"Risk(s) to respond to:\n{risks_text}\n\n"
         f"Relevant standard guidance (from our knowledge base):\n{guidance_text}\n\n"
+        f"{examples_text}"
         f"Write a tailored, step-by-step audit procedure that responds to the "
         f"risk(s) above and covers the listed assertions, consistent with the "
         f"guidance. Be specific and practical. Remember: describe the work to "

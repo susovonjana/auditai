@@ -23,15 +23,18 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import RATE_LIMIT_ASK, TOP_K_CHUNKS
+from config import RATE_LIMIT_ASK, TOP_K_CHUNKS, COPILOT_PRIME_MEMORY_ORG_ID
 from database import get_db, AsyncSessionLocal
 from embeddings import embed_query
 from rate_limit import limiter
 from routers.user import _load_session, _persist_ask_history
 import copilot_tools
+import proc_memory
 import qa
 import schemas
 import structured
+import tb_mapping_engine
+import tb_mapping_memory
 from prompts import procedure as procedure_prompt
 from prompts import findings as findings_prompt
 
@@ -102,6 +105,23 @@ async def generate_procedure(
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("procedure KB retrieval failed (continuing ungrounded): %s", exc)
 
+    # House-style few-shot examples (ticket A-1b): this org's closest accepted
+    # procedures. Best-effort — an empty/failed lookup just drafts without them.
+    risk_summary = proc_memory.summarize_risks(risks)
+    examples = []
+    try:
+        mems = await proc_memory.search_examples(
+            db,
+            organization_id=payload.organization_id,
+            client_sector=payload.client_sector,
+            audit_area=payload.audit_area or payload.section_title,
+            risk_summary=risk_summary,
+            k=3,
+        )
+        examples = [m.procedure_html for m in mems]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("proc_memory retrieval failed (continuing without examples): %s", exc)
+
     system = procedure_prompt.SYSTEM_PROMPT
     user_prompt = procedure_prompt.build_user_prompt(
         section_title=payload.section_title,
@@ -110,6 +130,7 @@ async def generate_procedure(
         assertions=payload.assertions,
         risks=risks,
         retrieved_chunks=[c.content for c in chunks],
+        examples=examples,
         language=payload.language,
     )
 
@@ -155,6 +176,34 @@ async def generate_procedure(
         media_type="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
+
+
+@router.post("/procedure/confirm")
+async def confirm_procedure(
+    payload: schemas.ProcedureConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Append an accepted AI-assisted procedure to this org's procedure memory
+    (ticket A-1b), so future drafts learn its house style. Additive only — no
+    1audit data is touched. Returns {stored, id}. Storing is best-effort: a
+    failure here must never break the auditor's save, so errors are swallowed."""
+    await _load_session(db, payload.session_token)
+    risks = [r.model_dump() for r in payload.risks]
+    try:
+        mem_id = await proc_memory.add_memory(
+            db,
+            organization_id=payload.organization_id,
+            client_sector=payload.client_sector,
+            audit_area=payload.audit_area or payload.section_title,
+            risk_summary=proc_memory.summarize_risks(risks),
+            assertions=payload.assertions,
+            procedure_html=payload.procedure_html,
+            confirmed_by=payload.user_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("proc_memory store failed: %s", exc)
+        return {"stored": False, "id": None}
+    return {"stored": bool(mem_id), "id": str(mem_id) if mem_id else None}
 
 
 @router.post("/findings")
@@ -371,6 +420,12 @@ async def chat_about_file(
             payload.language,
             kb_search=kb_search,
         )
+    except copilot_tools.CopilotGrantError as exc:
+        logger.info("Copilot chat grant rejected: %s", exc)
+        raise HTTPException(
+            status_code=401,
+            detail="Could not authorize AI access to this file's data (the grant may have expired). Please retry.",
+        )
     except Exception as exc:
         logger.exception("Copilot chat error: %s", exc)
         if qa.is_quota_error(exc):
@@ -407,3 +462,72 @@ async def chat_about_file(
         payload.organization_id,
     )
     return {"answer": answer, "sources": sources, "history_id": str(history_id)}
+
+
+@router.post("/tb-mapping")
+@limiter.limit(RATE_LIMIT_ASK)
+async def map_trial_balance(
+    request: Request,
+    payload: schemas.TbMappingRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Suggest a chart-of-account for each unmapped trial-balance account via the
+    3-tier cascade (ticket C-3): Tier-1 previous-data exact/fuzzy, Tier-2 org-trend
+    semantics + frequency prior (both deterministic, no Gemini), and an optional
+    Tier-3 LLM tail. Returns suggestions only — 1audit-be persists after the
+    auditor confirms. Never suggests a coa_original_id outside the candidate set."""
+    # Trusted server-to-server call from 1audit-be. A session token, when present,
+    # is validated for rate-limit scoping; absent is allowed (be already authorized).
+    if payload.session_token:
+        await _load_session(db, payload.session_token)
+
+    prime_org_id = payload.prime_org_id or COPILOT_PRIME_MEMORY_ORG_ID
+    suggestions = await tb_mapping_engine.map_accounts(
+        db,
+        organization_id=payload.organization_id,
+        client_sector=payload.client_sector,
+        accounts=payload.accounts,
+        coa=payload.coa,
+        prior_mappings=payload.prior_mappings,
+        prime_org_id=prime_org_id,
+        use_llm_tail=payload.use_llm_tail,
+        language=payload.language,
+    )
+    counts: dict = {}
+    for s in suggestions:
+        counts[s["tier"]] = counts.get(s["tier"], 0) + 1
+    return {"suggestions": suggestions, "tier_counts": counts}
+
+
+@router.post("/tb-mapping/feedback")
+@limiter.limit(RATE_LIMIT_ASK)
+async def tb_mapping_feedback(
+    request: Request,
+    payload: schemas.TbMappingFeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Append confirmed TB mappings (AI-accepted OR manual) to tb_mapping_memory so
+    the same account auto-resolves via Tier-1 next time (ticket C-6). Best-effort,
+    append-only — a storage failure is swallowed and never disrupts the caller."""
+    if payload.session_token:
+        await _load_session(db, payload.session_token)
+
+    stored = 0
+    for item in payload.items:
+        try:
+            mem_id = await tb_mapping_memory.add_mapping(
+                db,
+                organization_id=payload.organization_id,
+                client_sector=payload.client_sector,
+                account_name=item.account_name,
+                account_name_sl=item.account_name_sl,
+                account_code=item.account_code,
+                coa_original_id=item.coa_original_id,
+                coa_label=item.coa_label,
+                confirmed_by=payload.confirmed_by,
+            )
+            if mem_id:
+                stored += 1
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("tb-mapping feedback store failed: %s", exc)
+    return {"stored": stored}

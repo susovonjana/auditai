@@ -119,3 +119,27 @@ async def init_db() -> None:
                 """
             )
         )
+
+        # proc_memory (ticket A-1b) — cosine index for house-style retrieval.
+        await conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS proc_memory_embedding_idx
+                ON proc_memory
+                USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100)
+                """
+            )
+        )
+
+        # tb_mapping_memory (ticket C-2) — cosine index for TB auto-map recall.
+        await conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS tb_mapping_memory_embedding_idx
+                ON tb_mapping_memory
+                USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100)
+                """
+            )
+        )

@@ -21,10 +21,25 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 from pydantic import BaseModel
 
-from config import ONEAUDIT_BASE_URL, ONEAUDIT_HTTP_TIMEOUT
+from config import (
+    COPILOT_DATA_CACHE_TTL_SEC,
+    ONEAUDIT_BASE_URL,
+    ONEAUDIT_HTTP_TIMEOUT,
+)
+from copilot_cache import TTLCache
 from structured import ToolSpec, ToolLoopResult, generate_structured, run_tool_loop
 
 logger = logging.getLogger(__name__)
+
+# Process-wide short-TTL cache for file-data fetches (keyed by file+endpoint+args).
+# Shared across requests so a burst of questions reuses one fetch. File-scoped, so
+# different audit files never collide. See copilot_cache for the staleness model.
+_data_cache = TTLCache(COPILOT_DATA_CACHE_TTL_SEC)
+
+
+class CopilotGrantError(Exception):
+    """Raised when 1audit rejects the copilot grant (expired / wrong file). The
+    chat router maps this to a 401 so the UI can re-mint a grant."""
 
 
 class CopilotContext:
@@ -37,6 +52,7 @@ class CopilotContext:
         grant: str,
         base_url: Optional[str] = None,
         kb_search: Optional[Callable[[str], Any]] = None,
+        use_cache: bool = False,
     ):
         self.audit_file_id = int(audit_file_id)
         self.grant = grant
@@ -46,10 +62,19 @@ class CopilotContext:
         # never sweeps this file's data to answer "what is a branch?". Injected by
         # the router because retrieval is async and the tool loop is synchronous.
         self.kb_search = kb_search
+        # Serve repeated identical fetches from the short-TTL cache. Enabled only
+        # for the chat path (repeated questions), and only AFTER validate_grant()
+        # has confirmed this request's grant — so a cache hit never bypasses auth.
+        self.use_cache = bool(use_cache)
 
-    def get(self, endpoint: str, params: Optional[dict] = None) -> Any:
-        """GET {base}/copilot/audit_files/{id}/{endpoint}. Returns the response
-        `data` payload, or an {"error": ...} dict the LLM can reason about."""
+    def _cache_key(self, endpoint: str, params: Optional[dict]) -> str:
+        items = sorted((params or {}).items())
+        return f"{self.audit_file_id}:{endpoint}:{items}"
+
+    def _request(self, endpoint: str, params: Optional[dict]):
+        """Raw GET to 1audit-be. Returns (status_code, payload). status_code is
+        None on a network error; payload is the `data` body or an {"error": …}
+        dict the LLM (or caller) can reason about."""
         url = f"{self.base_url}/copilot/audit_files/{self.audit_file_id}/{endpoint}"
         try:
             resp = requests.get(
@@ -60,17 +85,46 @@ class CopilotContext:
             )
         except requests.RequestException as exc:
             logger.warning("copilot tool HTTP error (%s): %s", endpoint, exc)
-            return {"error": f"Could not reach 1audit for '{endpoint}'."}
+            return None, {"error": f"Could not reach 1audit for '{endpoint}'."}
         if resp.status_code != 200:
-            return {
+            return resp.status_code, {
                 "error": f"1audit returned HTTP {resp.status_code} for '{endpoint}'.",
                 "detail": _safe_json(resp),
             }
         body = _safe_json(resp)
         # 1audit-be wraps successful responses as { message, success, data }.
         if isinstance(body, dict) and "data" in body:
-            return body["data"]
-        return body
+            return 200, body["data"]
+        return 200, body
+
+    def get(self, endpoint: str, params: Optional[dict] = None) -> Any:
+        """GET {base}/copilot/audit_files/{id}/{endpoint}. Returns the response
+        `data` payload, or an {"error": ...} dict the LLM can reason about. When
+        caching is enabled, a fresh identical fetch is served from memory; only
+        successful (non-error) responses are cached."""
+        if self.use_cache:
+            key = self._cache_key(endpoint, params)
+            cached = _data_cache.get(key)
+            if cached is not None:
+                return cached
+        status, payload = self._request(endpoint, params)
+        if self.use_cache and status == 200:
+            _data_cache.set(self._cache_key(endpoint, params), payload)
+        return payload
+
+    def validate_grant(self) -> None:
+        """Confirm this request's grant is valid for this file via ONE real
+        (uncached) summary fetch. Raises CopilotGrantError on an auth rejection
+        (401/403) so the chat router can return a clean 401. A network/5xx error
+        does NOT block — the tool loop then surfaces it gracefully. On success the
+        summary is warmed into the cache, so the model's get_audit_file_summary
+        tool reuses it."""
+        status, payload = self._request("summary", None)
+        if status in (401, 403):
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise CopilotGrantError(detail or "Copilot grant rejected for this file.")
+        if status == 200 and self.use_cache:
+            _data_cache.set(self._cache_key("summary", None), payload)
 
 
 def _safe_json(resp) -> Any:
@@ -371,7 +425,15 @@ def answer_about_file(
     When ``kb_search`` is supplied the model also gets search_standards, so it
     can route general/help/standards questions to the knowledge base instead of
     sweeping this file's data. Returns ToolLoopResult(answer, tools_used)."""
-    ctx = CopilotContext(audit_file_id, grant, base_url, kb_search=kb_search)
+    # use_cache=True: across a burst of questions, repeated identical fetches
+    # (summary, full trial balance, risks…) are served from the short-TTL cache
+    # instead of re-querying 1audit-be. validate_grant() does one real summary
+    # fetch first, so every chat request re-checks authorization before any cache
+    # hit and warms the summary entry. (Raises CopilotGrantError on a bad grant.)
+    ctx = CopilotContext(
+        audit_file_id, grant, base_url, kb_search=kb_search, use_cache=True
+    )
+    ctx.validate_grant()
     impls = build_tool_impls(ctx)
     specs = TOOL_SPECS + [STANDARDS_TOOL_SPEC] if kb_search else TOOL_SPECS
     lang_name = "Arabic" if language == "ar" else "English"
