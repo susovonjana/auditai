@@ -62,8 +62,8 @@ FROM python:3.11-slim-bookworm AS models
 
 COPY --from=deps /install /usr/local
 
-ARG EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-ARG RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+ARG EMBEDDING_MODEL=intfloat/multilingual-e5-small
+ARG RERANKER_MODEL=cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
 
 ENV HF_HOME=/models \
     TRANSFORMERS_CACHE=/models \

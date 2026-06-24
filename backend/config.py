@@ -135,15 +135,24 @@ GEMINI_MODEL: str = GEMINI_MODELS[0]
 GEMINI_MODEL_COOLDOWN_SEC: int = int(os.getenv("GEMINI_MODEL_COOLDOWN_SEC", "600"))
 
 # Local embeddings (sentence-transformers)
-# bge-small-en-v1.5 is 384-dim and substantially more accurate than MiniLM.
+# multilingual-e5-small is 384-dim and multilingual (~100 langs incl. Arabic),
+# so Arabic TB account names / COA labels / procedures match well. Same 384-dim
+# as the old English-only models (bge-small-en / MiniLM) → no schema change, but
+# switching models requires re-embedding all stored vectors (see reembed_all.py).
 LOCAL_EMBEDDING_MODEL: str = os.getenv(
-    "LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"
+    "LOCAL_EMBEDDING_MODEL", "intfloat/multilingual-e5-small"
 )
 EMBEDDING_DIMENSIONS: int = int(os.getenv("EMBEDDING_DIMENSIONS", "384"))
 
-# Cross-encoder reranker (~80 MB, loaded once at first request)
+# Cross-encoder reranker (loaded once at first request). Multilingual
+# (mMARCO, 14 languages incl. Arabic) so Arabic KB chunks are re-scored
+# correctly after the e5 multilingual embeddings retrieve them. ~117M params
+# (~470 MB on disk / ~250 MB resident) — heavier than the old English-only
+# ms-marco-MiniLM-L-6-v2 (~22M). Scores at query time; nothing stored, so a
+# model swap needs NO re-embedding — just rebuild the image to bake it in.
+# English-only fallback at lower footprint: cross-encoder/ms-marco-MiniLM-L-6-v2.
 RERANKER_MODEL: str = os.getenv(
-    "RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    "RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 )
 USE_RERANKER: bool = os.getenv("USE_RERANKER", "true").lower() == "true"
 

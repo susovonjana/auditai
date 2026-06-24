@@ -126,9 +126,12 @@ def _parse_rewrites(text: str, n: int) -> List[str]:
 
 def _call_gemini_sync(prompt: str) -> str:
     """Sync call — imported lazily to avoid circular imports with qa.py."""
-    from qa import _get_gemini  # local import: qa imports this module too
+    from qa import _get_gemini, _model_order  # local import: qa imports this module too
 
-    model = _get_gemini()
+    # _get_gemini now REQUIRES a model name (multi-model failover, P-1). Pick the
+    # first non-cooled model, matching how qa.py selects one. Without this the
+    # call raised TypeError and expansion silently fell back to single-query.
+    model = _get_gemini(_model_order()[0])
     resp = model.generate_content(
         prompt,
         generation_config={
