@@ -184,6 +184,15 @@ class ProcedureRequest(BaseModel):
     assertions: List[str] = Field(default_factory=list, max_length=40)
     client_sector: Optional[str] = Field(None, max_length=256)
     audit_area: Optional[str] = Field(None, max_length=256)
+    # Optional free-text steer from the auditor (focus / depth / emphasis /
+    # wording). Combined with the section context when drafting.
+    custom_instruction: Optional[str] = Field(None, max_length=2000)
+    # Optional file grounding. When the auditor types a custom_instruction that
+    # references this file's data (e.g. "use the client name"), the route runs the
+    # grounded tool-loop so it reads the real value. Absent / no instruction ⇒ the
+    # standard ungrounded house-style draft (still streamed).
+    audit_file_id: Optional[int] = None
+    copilot_grant: Optional[str] = None
     language: str = Field("en", pattern="^(en|ar)$")
     # Optional caller identity (1audit embed). Accepts int or str.
     user_id: Optional[str] = None
@@ -192,6 +201,46 @@ class ProcedureRequest(BaseModel):
     @field_validator("user_id", "organization_id", mode="before")
     @classmethod
     def _stringify_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+# =========================================================================
+# Copilot — generic AI writing assistant (POST /copilot/write)
+# =========================================================================
+class WriteAssistRequest(BaseModel):
+    """Free-form writing helper for ANY rich-text field in 1audit. Takes the
+    field's current text + an optional instruction and drafts / rewrites it.
+
+    When called from INSIDE an audit file the FE also sends ``audit_file_id`` +
+    ``copilot_grant``; the route then runs the GROUNDED tool-loop so the draft can
+    read this file's real data (client name, figures, dates) when the instruction
+    needs it — never inventing a placeholder. Without the grant it stays a generic,
+    ungrounded writer (and must never state client figures)."""
+    session_token: str
+    # The field's existing content (plain text; the FE strips HTML before sending).
+    current_text: Optional[str] = Field(None, max_length=20000)
+    # Optional free-text steer (focus / depth / tone / wording). Blank ⇒ polish.
+    custom_instruction: Optional[str] = Field(None, max_length=2000)
+    # Optional hint about what the field is for (e.g. "Risk description").
+    field_label: Optional[str] = Field(None, max_length=256)
+    # Optional procedure context. Present when the field documents/answers a
+    # specific procedure (the note/findings + response fields) — the grounded
+    # writer then drafts grounded in that procedure's real results by default,
+    # while still honouring any custom_instruction. Empty for free-form fields.
+    procedure: Optional[str] = Field(None, max_length=20000)
+    # Optional file grounding (present only when the editor is inside an audit
+    # file). Both must be set together to enable the grounded tool-loop path.
+    audit_file_id: Optional[int] = None
+    copilot_grant: Optional[str] = None
+    language: str = Field("en", pattern="^(en|ar)$")
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_write_ids(cls, v):
         if v is None or v == "":
             return None
         return str(v)
@@ -217,31 +266,6 @@ class ProcedureConfirmRequest(BaseModel):
     @field_validator("user_id", "organization_id", mode="before")
     @classmethod
     def _stringify_confirm_ids(cls, v):
-        if v is None or v == "":
-            return None
-        return str(v)
-
-
-# =========================================================================
-# Copilot — AI draft findings (ticket A-6)
-# =========================================================================
-class ProcedureFindingsRequest(BaseModel):
-    session_token: str
-    audit_file_id: int
-    copilot_grant: str
-    # The procedure text the auditor is responding to (HTML or plain).
-    procedure: Optional[str] = Field(None, max_length=20000)
-    # Optional linkage to narrow which account's results to read.
-    account: Optional[str] = Field(None, max_length=256)
-    coa_original_id: Optional[int] = None
-    assertions: List[str] = Field(default_factory=list, max_length=40)
-    language: str = Field("en", pattern="^(en|ar)$")
-    user_id: Optional[str] = None
-    organization_id: Optional[str] = None
-
-    @field_validator("user_id", "organization_id", mode="before")
-    @classmethod
-    def _stringify_findings_ids(cls, v):
         if v is None or v == "":
             return None
         return str(v)

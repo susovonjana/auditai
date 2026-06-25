@@ -10,8 +10,11 @@ like an account name. This enforces least privilege: the LLM can read only the
 one file the grant authorises.
 
 Used by:
-  - answer_about_file(...)       — the file-mode chat (tool-calling loop)
-  - the /copilot/findings route  — calls the impls directly for grounded findings
+  - answer_about_file(...)        — the file-mode chat (tool-calling loop)
+  - write_with_file(...)          — the ONE grounded in-file writer (note / response
+                                    / comment), via /copilot/write
+  - the /copilot/procedure route  — grounds a procedure draft when the auditor's
+                                    instruction needs file data (shares the tools)
 """
 from __future__ import annotations
 
@@ -506,67 +509,128 @@ def needs_file_data(question: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Respond to a procedure (the "AI response" button)
+# Grounded in-file writer (the ✨ "Generate with AI" button inside an audit file)
 # ---------------------------------------------------------------------------
-# A procedure is often a direct question ("What is the figure of the Salary
-# account in the TB?"). The tool loop lets the model fetch the EXACT data it
-# needs (e.g. get_trial_balance filtered by name) and answer precisely, instead
-# of forcing a substantive-testing template onto a simple lookup.
-RESPONSE_SYSTEM_PROMPT = (
-    "You are an audit assistant drafting the auditor's RESPONSE to ONE audit "
-    "procedure, using ONLY this file's real data obtained through the tools. "
-    "Accuracy is critical (ISA 220): never invent figures, names, dates, or "
-    "conclusions — every number you state must come from a tool result.\n\n"
-    "Work out what the procedure needs, then respond accordingly:\n"
-    "1. DIRECT QUESTION (asks for a figure, balance, account, list or "
-    "comparison): ANSWER IT DIRECTLY and concisely. Call the tools to find the "
-    "exact value — get_trial_balance or get_financial_statement for figures, "
-    "get_working_paper for another working paper's answers, get_audit_area for an "
-    "account's testing — then state it with the account name + code and the "
-    "period. Do NOT add 'testing not performed' wording — a factual lookup needs "
-    "no testing.\n"
-    "2. SUBSTANTIVE TEST (sample / verify / recompute / confirm) and the tools "
-    "show results: summarise what was found, including any exceptions.\n"
-    "3. SUBSTANTIVE TEST but the tools show NO results were recorded: briefly "
-    "state the work still to be performed — do NOT claim it was done, do NOT "
-    "write 'no exceptions', do NOT fabricate.\n"
-    "If the tools do not contain the answer, say so plainly.\n\n"
-    "ANSWER QUALITY:\n"
-    "- Answer the EXACT thing the procedure asks. State each figure with the "
-    "account name + code, the period (label current year vs prior year), and the "
-    "currency.\n"
-    "- ADAPT THE DEPTH to the procedure: for a simple lookup give just the "
-    "value(s) tightly, no padding; for a comparison / variance / analytical "
-    "procedure add ONE short grounded line on the size and direction of the "
-    "change and why it may matter — never speculate beyond the figures.\n"
-    "- Bold the key figures and values with <strong>.\n\n"
+# The SINGLE grounded engine for every non-procedure field inside an audit file —
+# the note/findings field, the response field, AND free-form comment/other fields
+# all run through here so they behave identically (the user explicitly asked for
+# one consistent grounded assistant, 2026-06-25). Bound to ONE audit file via a
+# grant; it reads the file's real data through the tools when the field needs it.
+#
+# It adapts to what it's given:
+#   - a <procedure> present  → the field documents/answers that procedure (note or
+#     response): draft grounded in the procedure's REAL results (force a data fetch
+#     first, so the answer is always grounded).
+#   - no procedure, just text → free-form field (comment/title/etc.): polish or
+#     draft per the instruction; fetch a file fact only when the instruction needs
+#     one (e.g. "the client name") — otherwise no tool call.
+WRITE_SYSTEM_PROMPT = (
+    "You are an audit assistant helping an auditor write the text of a SINGLE "
+    "field of a working paper. You are bound to ONE audit file and read its real "
+    "data through the tools. Accuracy is critical (ISA 220): never invent a "
+    "figure, name, date or conclusion, and NEVER emit a bracketed placeholder "
+    "like '[Client Name]' or '[amount]'. If a value cannot be fetched from the "
+    "file, write a short plain sentence saying so (and, if useful, where it is "
+    "set) instead of a placeholder.\n\n"
+    "WORK OUT WHAT THE FIELD NEEDS:\n"
+    "1. If a <procedure> is provided, this field is the auditor's note / findings "
+    "/ response FOR that procedure. Draft it grounded in the file's real data: "
+    "call the tools to fetch the relevant account's figures and results "
+    "(get_trial_balance / get_financial_statement / get_audit_area / "
+    "get_procedure_results), then —\n"
+    "   - DIRECT QUESTION (asks for a figure, balance, account, list or "
+    "comparison): answer it directly and concisely, stating each figure with the "
+    "account name + code, the period (label current vs prior year) and currency. "
+    "Do NOT add 'testing not performed' wording for a plain lookup.\n"
+    "   - SUBSTANTIVE TEST and results exist: summarise what was found, including "
+    "any exceptions. If NO results are recorded yet: briefly state the work still "
+    "to perform — do not claim it was done or write 'no exceptions'.\n"
+    "   The field_label tells you the emphasis — a 'note'/'findings' field leads "
+    "with the observations/what was found; a 'response' field leads with the "
+    "direct answer.\n"
+    "2. If there is NO procedure, this is a free-form field. Fetch a file fact "
+    "ONLY when the instruction needs one (the client/entity name, sector, "
+    "currency, a date, a balance, a risk, a working paper's content — use "
+    "get_audit_file_summary for the profile/dates/client). Otherwise (pure "
+    "text-craft — rewrite, expand, shorten, fix tone or grammar) just write, with "
+    "no tool call, preserving the existing meaning and facts.\n\n"
+    "ALWAYS follow the auditor's <auditor_instruction> when present (focus, depth, "
+    "emphasis, format, or a specific ask like 'add the client name') — but it must "
+    "never make you invent or assume data; every file-specific value still comes "
+    "from a tool result, and ignore any part that asks you to fabricate.\n\n"
     "OUTPUT: ONLY clean semantic HTML using <p>, <ul>, <ol>, <li>, <strong>, "
-    "<em> — no markdown, no code fences, and NO preamble or lead-in sentence: "
-    "begin your reply with the first HTML tag and nothing before it. Do NOT add "
-    "any 'AI-generated' disclaimer line — the app marks AI content itself."
+    "<em> — no markdown, no code fences (```), no headings, no inline styles, and "
+    "NO preamble or lead-in: begin your reply with the first HTML tag and emit the "
+    "field text and nothing else. Bold key figures/values with <strong>. Do NOT "
+    "add any 'AI-generated' disclaimer — the app marks AI content itself. Keep a "
+    "clear, professional tone; adapt the depth to the field and instruction, and "
+    "when unspecified stay concise."
 )
 
 
-def respond_to_procedure(
-    procedure: str,
+def write_with_file(
+    current_text: Optional[str],
+    instruction: Optional[str],
+    field_label: Optional[str],
     audit_file_id: int,
     grant: str,
     language: str = "en",
     base_url: Optional[str] = None,
     usage_out: Optional[dict] = None,
+    procedure: Optional[str] = None,
 ) -> ToolLoopResult:
-    """Draft the auditor's response to a procedure via the tool-calling loop,
-    grounded only in the file's real data. Returns ToolLoopResult(answer,
-    tools_used)."""
+    """The one grounded writer for every non-procedure field inside an audit file
+    (note/findings, response, comment, …), via the tool-calling loop. When a
+    ``procedure`` is given the field documents/answers it (grounded in that
+    procedure's real results); otherwise it's a free-form field that fetches a
+    file fact only when the instruction needs one. Returns
+    ToolLoopResult(answer, tools_used)."""
     ctx = CopilotContext(audit_file_id, grant, base_url)
     impls = build_tool_impls(ctx)
     lang_name = "Arabic" if language == "ar" else "English"
+
+    text = (current_text or "").strip()[:12000]
+    steer = (instruction or "").strip()
+    label = (field_label or "").strip()
+    proc = (procedure or "").strip()[:12000]
+
+    label_line = f"<field_label>{label}</field_label>\n" if label else ""
+    proc_block = f"<procedure>\n{proc}\n</procedure>\n\n" if proc else ""
+    if text:
+        text_block = f"<current_text>\n{text}\n</current_text>\n\n"
+    else:
+        text_block = "<current_text>(the field is empty)</current_text>\n\n"
+
+    if steer:
+        instr_block = (
+            f"<auditor_instruction>\n{steer}\n</auditor_instruction>\n\n"
+        )
+    elif proc:
+        instr_block = (
+            "No extra instruction was given. Draft this field for the procedure "
+            "above, grounded in the file's real data.\n\n"
+        )
+    elif text:
+        instr_block = (
+            "No instruction was given. Improve the wording, clarity, structure and "
+            "professionalism of the current text without changing its meaning or "
+            "adding facts. Do not call any tool.\n\n"
+        )
+    else:
+        instr_block = (
+            "No instruction and no text were provided. Write a short, neutral "
+            "professional placeholder paragraph the auditor can replace. Do not "
+            "call any tool.\n\n"
+        )
+
     user = (
-        f"<procedure>\n{procedure}\n</procedure>\n\n"
-        f"Draft the auditor's response to the procedure above in {lang_name}, "
-        f"using this file's real data fetched through the tools."
+        f"{label_line}{proc_block}{text_block}{instr_block}"
+        f"Produce the field text now, following the output rules. Write in {lang_name}."
     )
+    # Force a first tool call only when documenting/answering a procedure (the
+    # note/response case must be grounded in real results, like respond did). A
+    # free-form field decides for itself whether it needs the tools.
     return run_tool_loop(
-        RESPONSE_SYSTEM_PROMPT, user, TOOL_SPECS, impls, max_steps=6,
-        force_first_call=True, usage_out=usage_out,
+        WRITE_SYSTEM_PROMPT, user, TOOL_SPECS, impls, max_steps=6,
+        force_first_call=bool(proc), usage_out=usage_out,
     )

@@ -37,7 +37,7 @@ import tb_mapping_engine
 import tb_mapping_memory
 import usage_meter
 from prompts import procedure as procedure_prompt
-from prompts import findings as findings_prompt
+from prompts import write as write_prompt
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/copilot", tags=["copilot"])
@@ -49,6 +49,24 @@ def _strip_fences(text: str) -> str:
     if not text:
         return text
     return text.replace("```html", "").replace("```HTML", "").replace("```", "")
+
+
+# Appended to the procedure SYSTEM prompt when the auditor's instruction may need
+# this file's real data (grounded path). Gives the model the file tools so an
+# instruction like "use the client name" reads the real value instead of a
+# placeholder, without changing the normal procedure-drafting behaviour.
+PROCEDURE_GROUNDING_ADDENDUM = (
+    "\n\nFILE DATA (GROUNDING): You also have tools to read THIS audit file's real "
+    "data. When the auditor's instruction asks for a file-specific fact — the "
+    "client/entity name, sector, reporting currency, a date, an account balance or "
+    "a figure — CALL THE RIGHT TOOL to fetch it (get_audit_file_summary for the "
+    "client/profile/dates, get_trial_balance / get_audit_area / "
+    "get_financial_statement for figures) and use the REAL value. Never invent a "
+    "file-specific value and never write a bracketed placeholder like "
+    "'[Client Name]'; if a tool cannot provide it, say so plainly. If the "
+    "instruction needs no file data, draft the procedure normally without calling "
+    "any tool."
+)
 
 
 # How long the synchronous tool loop will block waiting for one KB search
@@ -135,12 +153,72 @@ async def generate_procedure(
         retrieved_chunks=[c.content for c in chunks],
         examples=examples,
         language=payload.language,
+        custom_instruction=payload.custom_instruction,
     )
 
     started = time.perf_counter()
     document_filenames = list({c.document_filename for c in chunks})
     req_id = uuid.uuid4().hex
     usage: dict = {}
+
+    # Ground the draft ONLY when the auditor typed an instruction AND we have a
+    # grant — that's the case where it might reference file data ("use the client
+    # name"). The default (no instruction) keeps streaming the house-style draft,
+    # which never needs file data. The tool loop is synchronous → one NDJSON delta.
+    instruction = (payload.custom_instruction or "").strip()
+    if payload.audit_file_id and payload.copilot_grant and instruction:
+        ctx = copilot_tools.CopilotContext(payload.audit_file_id, payload.copilot_grant)
+        impls = copilot_tools.build_tool_impls(ctx)
+        system_grounded = system + PROCEDURE_GROUNDING_ADDENDUM
+
+        async def grounded_stream():
+            yield json.dumps(
+                {
+                    "type": "meta",
+                    "chunks_found": len(chunks),
+                    "documents": document_filenames,
+                    "grounded": True,
+                }
+            ) + "\n"
+            try:
+                result = await asyncio.to_thread(
+                    structured.run_tool_loop,
+                    system_grounded, user_prompt, copilot_tools.TOOL_SPECS, impls,
+                    max_steps=6, force_first_call=False, usage_out=usage,
+                )
+                answer = _strip_fences(result.answer or "").strip()
+                if answer:
+                    yield json.dumps({"type": "delta", "text": answer}) + "\n"
+                else:
+                    yield json.dumps(
+                        {"type": "error", "message": "Generation interrupted; please retry."}
+                    ) + "\n"
+            except Exception as exc:
+                logger.exception("Grounded procedure error: %s", exc)
+                message = (
+                    qa.friendly_llm_error(exc)
+                    if qa.is_quota_error(exc)
+                    else "Generation interrupted; please retry."
+                )
+                yield json.dumps({"type": "error", "message": message}) + "\n"
+
+            await usage_meter.record_usage(
+                db, organization_id=payload.organization_id, user_id=payload.user_id,
+                feature="procedure", tier="smart", usage=usage, request_id=req_id,
+            )
+            yield json.dumps(
+                {
+                    "type": "done",
+                    "response_time_ms": int((time.perf_counter() - started) * 1000),
+                    "documents": document_filenames,
+                }
+            ) + "\n"
+
+        return StreamingResponse(
+            grounded_stream(),
+            media_type="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
 
     async def event_stream():
         yield json.dumps(
@@ -215,81 +293,106 @@ async def confirm_procedure(
     return {"stored": bool(mem_id), "id": str(mem_id) if mem_id else None}
 
 
-@router.post("/findings")
+@router.post("/write")
 @limiter.limit(RATE_LIMIT_ASK)
-async def generate_findings(
+async def write_assist(
     request: Request,
-    payload: schemas.ProcedureFindingsRequest,
+    payload: schemas.WriteAssistRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream an AI-drafted FINDINGS narrative for a procedure, grounded ONLY in
-    the audit file's real results (TB figures + sampling) fetched live from
-    1audit-be via the copilot grant. Never invents figures (ISA 220)."""
+    """Generic AI writing assistant for ANY rich-text field. Streams clean semantic
+    HTML drafted/rewritten from the field's current text + the auditor's optional
+    instruction.
+
+    Two modes, chosen by whether the FE sent file grounding:
+      - GROUNDED (audit_file_id + copilot_grant present): runs the copilot
+        tool-loop so the draft can read THIS file's real data when the instruction
+        needs a file fact (client name, a figure, a date). Never invents — if a
+        value can't be fetched it says so rather than emitting a placeholder.
+      - UNGROUNDED (no grant): a pure text-craft writer, never states client
+        figures (ISA 220).
+    Event format mirrors /procedure exactly (NDJSON)."""
+    # Same anonymous-session + per-org budget gate as the other copilot writers.
     await _load_session(db, payload.session_token)
     await usage_meter.ensure_credits(db, payload.organization_id)
-
-    ctx = copilot_tools.CopilotContext(payload.audit_file_id, payload.copilot_grant)
-    # Fetch the linked account's real results + the file summary (blocking HTTP
-    # → run in threads). Best-effort: a failure becomes an {"error": …} dict.
-    results = await asyncio.to_thread(
-        ctx.get,
-        "procedure_results",
-        {"coa_original_id": payload.coa_original_id, "account": payload.account},
-    )
-    summary = await asyncio.to_thread(ctx.get, "summary")
-
-    # If we couldn't read ANY file data, the grant is likely invalid/expired.
-    results_failed = isinstance(results, dict) and results.get("error")
-    summary_failed = isinstance(summary, dict) and summary.get("error")
-    grant_broken = bool(results_failed and summary_failed)
-
-    testing_performed = bool(
-        isinstance(results, dict) and results.get("testing_performed")
-    )
-    system = findings_prompt.SYSTEM_PROMPT
-    user_prompt = findings_prompt.build_user_prompt(
-        procedure_text=payload.procedure,
-        results=results,
-        summary=summary,
-        assertions=payload.assertions,
-        language=payload.language,
-        testing_performed=testing_performed,
-    )
 
     started = time.perf_counter()
     req_id = uuid.uuid4().hex
     usage: dict = {}
 
-    async def event_stream():
-        yield json.dumps(
-            {
-                "type": "meta",
-                "testing_performed": testing_performed,
-                "data_available": not grant_broken,
-            }
-        ) + "\n"
+    grounded = bool(payload.audit_file_id and payload.copilot_grant)
 
-        if grant_broken:
-            yield json.dumps(
-                {
-                    "type": "error",
-                    "message": "Could not read this file's data (the copilot grant may have expired). Please try again.",
-                }
-            ) + "\n"
+    if grounded:
+        # File-grounded: the tool loop is synchronous (returns the full answer),
+        # so we run it off-thread and emit it as one NDJSON delta. The meta event
+        # is sent first so the FE clears the editor and the stall-timer is armed.
+        async def grounded_stream():
+            yield json.dumps({"type": "meta", "grounded": True}) + "\n"
+            try:
+                result = await asyncio.to_thread(
+                    copilot_tools.write_with_file,
+                    payload.current_text,
+                    payload.custom_instruction,
+                    payload.field_label,
+                    payload.audit_file_id,
+                    payload.copilot_grant,
+                    payload.language,
+                    usage_out=usage,
+                    procedure=payload.procedure,
+                )
+                answer = _strip_fences(result.answer or "").strip()
+                if answer:
+                    yield json.dumps({"type": "delta", "text": answer}) + "\n"
+                else:
+                    yield json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Could not read this file's data (the copilot grant may have expired). Please try again.",
+                        }
+                    ) + "\n"
+            except Exception as exc:
+                logger.exception("Grounded write-assist error: %s", exc)
+                message = (
+                    qa.friendly_llm_error(exc)
+                    if qa.is_quota_error(exc)
+                    else "Generation interrupted; please retry."
+                )
+                yield json.dumps({"type": "error", "message": message}) + "\n"
+
+            await usage_meter.record_usage(
+                db, organization_id=payload.organization_id, user_id=payload.user_id,
+                feature="write", tier="smart", usage=usage, request_id=req_id,
+            )
             yield json.dumps(
                 {"type": "done", "response_time_ms": int((time.perf_counter() - started) * 1000)}
             ) + "\n"
-            return
+
+        return StreamingResponse(
+            grounded_stream(),
+            media_type="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
+
+    system = write_prompt.SYSTEM_PROMPT
+    user_prompt = write_prompt.build_user_prompt(
+        current_text=payload.current_text,
+        custom_instruction=payload.custom_instruction,
+        field_label=payload.field_label,
+        language=payload.language,
+    )
+
+    async def event_stream():
+        yield json.dumps({"type": "meta"}) + "\n"
 
         try:
             async for piece in structured.astream_text(
-                system, user_prompt, temperature=0.2, max_output_tokens=4096, usage_out=usage
+                system, user_prompt, temperature=0.4, max_output_tokens=4096, usage_out=usage
             ):
                 cleaned = _strip_fences(piece)
                 if cleaned:
                     yield json.dumps({"type": "delta", "text": cleaned}) + "\n"
         except Exception as exc:
-            logger.exception("Findings streaming error: %s", exc)
+            logger.exception("Write-assist streaming error: %s", exc)
             message = (
                 qa.friendly_llm_error(exc)
                 if qa.is_quota_error(exc)
@@ -299,14 +402,10 @@ async def generate_findings(
 
         await usage_meter.record_usage(
             db, organization_id=payload.organization_id, user_id=payload.user_id,
-            feature="findings", tier="smart", usage=usage, request_id=req_id,
+            feature="write", tier="smart", usage=usage, request_id=req_id,
         )
         yield json.dumps(
-            {
-                "type": "done",
-                "response_time_ms": int((time.perf_counter() - started) * 1000),
-                "testing_performed": testing_performed,
-            }
+            {"type": "done", "response_time_ms": int((time.perf_counter() - started) * 1000)}
         ) + "\n"
 
     return StreamingResponse(
@@ -314,54 +413,6 @@ async def generate_findings(
         media_type="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
-
-
-@router.post("/respond")
-@limiter.limit(RATE_LIMIT_ASK)
-async def generate_response(
-    request: Request,
-    payload: schemas.ProcedureFindingsRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """Answer/respond to an audit procedure using ONLY the file's real data, via
-    the copilot tool-calling loop (precise — it can filter the trial balance by
-    account name to fetch the exact figure a question asks for). Non-streaming:
-    returns the drafted response as clean HTML. Never invents figures (ISA 220)."""
-    await _load_session(db, payload.session_token)
-
-    if not (payload.procedure and payload.procedure.strip()):
-        raise HTTPException(status_code=422, detail="procedure text is required")
-
-    await usage_meter.ensure_credits(db, payload.organization_id)
-    usage: dict = {}
-    try:
-        result = await asyncio.to_thread(
-            copilot_tools.respond_to_procedure,
-            payload.procedure,
-            payload.audit_file_id,
-            payload.copilot_grant,
-            payload.language,
-            usage_out=usage,
-        )
-    except Exception as exc:
-        logger.exception("Procedure response error: %s", exc)
-        if qa.is_quota_error(exc):
-            raise HTTPException(status_code=429, detail=qa.friendly_llm_error(exc))
-        raise HTTPException(
-            status_code=502, detail="Could not draft a response. Please retry."
-        )
-
-    answer = _strip_fences(result.answer or "").strip()
-    if not answer:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not read this file's data (the copilot grant may have expired). Please try again.",
-        )
-    await usage_meter.record_usage(
-        db, organization_id=payload.organization_id, user_id=payload.user_id,
-        feature="respond", tier="smart", usage=usage,
-    )
-    return {"answer": answer, "tools_used": result.tools_used}
 
 
 @router.post("/chat")

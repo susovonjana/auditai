@@ -57,6 +57,7 @@ def build_user_prompt(
     retrieved_chunks: List[str],
     examples: Optional[List[str]] = None,
     language: str = "en",
+    custom_instruction: Optional[str] = None,
 ) -> str:
     """Assemble the USER prompt from the section context + retrieved KB guidance.
 
@@ -114,6 +115,15 @@ def build_user_prompt(
 
     section_line = f"Section / work area: {_clean(section_title)}\n" if _clean(section_title) else ""
 
+    instruction = _clean(custom_instruction)
+    instruction_text = ""
+    if instruction:
+        instruction_text = (
+            f"Auditor's instruction for this draft (follow it for focus, depth, "
+            f"emphasis or wording — but keep describing the WORK TO PERFORM and "
+            f"never state client figures or conclusions): {instruction}\n\n"
+        )
+
     return (
         f"{section_line}"
         f"Audit area: {area}\n"
@@ -122,6 +132,7 @@ def build_user_prompt(
         f"Risk(s) to respond to:\n{risks_text}\n\n"
         f"Relevant standard guidance (from our knowledge base):\n{guidance_text}\n\n"
         f"{examples_text}"
+        f"{instruction_text}"
         f"Write a tailored, step-by-step audit procedure that responds to the "
         f"risk(s) above and covers the listed assertions, consistent with the "
         f"guidance. Be specific and practical. Remember: describe the work to "
