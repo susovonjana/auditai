@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 import config
 import structured
+import usage_meter
 import tb_mapping_memory as memory
 from copilot_cache import TTLCache
 from embeddings import embed_queries, embed_texts
@@ -153,10 +154,10 @@ def _tier2_rationale(sem: float, votes: float, sector: Optional[str], label: Opt
 
 
 # --- Tier-3 structured-output schema (only used when use_llm_tail=True) ---
-# NOTE: NO field defaults here. Gemini's response_schema is a Vertex Schema proto
-# that has no `default` keyword — a Pydantic default leaks a `default` key into the
-# generated schema and the SDK rejects it ("Unknown field for Schema: default"),
-# which silently degraded the whole tail to Tier-2. Keep every field required.
+# Emitted via Bedrock forced tool-use: the model is made to call a tool whose
+# input_schema is this model's JSON schema, and we validate the tool input back
+# into it. coa_original_id is nullable so the model can abstain; every field stays
+# required (no defaults) so the shortlist contract is unambiguous.
 class _LlmMapping(BaseModel):
     tb_account_id: int
     coa_original_id: Optional[int]
@@ -201,16 +202,20 @@ def _build_llm_prompt(tail: list, coa_index: dict, language: str) -> str:
     return "\n".join(lines)
 
 
-async def _run_llm_tail(tail: list, coa_index: dict, valid_ids: set, language: str) -> dict:
-    """Resolve the deferred accounts with structured Gemini calls, in sub-batches
-    so the JSON response never overruns the output-token budget (a large tail in
-    ONE call truncates → invalid JSON → the whole tail is lost). Returns a map
-    tb_account_id -> _LlmMapping. Best-effort: a failed sub-batch is skipped (those
-    accounts keep their Tier-2 guess), the rest still resolve."""
+async def _run_llm_tail(
+    tail: list, coa_index: dict, valid_ids: set, language: str
+) -> tuple[dict, dict]:
+    """Resolve the deferred accounts with structured Bedrock (smart-tier) calls,
+    in sub-batches so the JSON response never overruns the output-token budget (a
+    large tail in ONE call truncates → invalid JSON → the whole tail is lost).
+    Returns ``(picks, usage)`` where picks maps tb_account_id -> (cid, conf,
+    rationale) and usage is the aggregated {"input","output","model"} for metering.
+    Best-effort: a failed sub-batch is skipped (those accounts keep their Tier-2
+    guess), the rest still resolve."""
     if not tail:
-        return {}
-    # Cap the number of accounts that reach Gemini so a huge tail can't balloon into
-    # dozens of calls. The overflow keeps its (already-computed) Tier-2 guess.
+        return {}, {}
+    # Cap the number of accounts that reach the LLM so a huge tail can't balloon
+    # into dozens of calls. The overflow keeps its (already-computed) Tier-2 guess.
     full = len(tail)
     if _LLM_TAIL_MAX_ACCOUNTS > 0 and full > _LLM_TAIL_MAX_ACCOUNTS:
         logger.info(
@@ -220,43 +225,50 @@ async def _run_llm_tail(tail: list, coa_index: dict, valid_ids: set, language: s
         tail = tail[:_LLM_TAIL_MAX_ACCOUNTS]
 
     subs = [tail[i:i + _LLM_TAIL_BATCH] for i in range(0, len(tail), _LLM_TAIL_BATCH)]
-    # Bounded concurrency: a Semaphore(1) keeps this sequential (free-tier-safe);
-    # raise COPILOT_TB_LLM_CONCURRENCY on a paid key to run sub-batches in parallel
-    # so a large tail resolves in ~one call's time instead of N.
+    # Bounded concurrency: a Semaphore(1) keeps this sequential; raise
+    # COPILOT_TB_LLM_CONCURRENCY to run sub-batches in parallel so a large tail
+    # resolves in ~one call's time instead of N.
     sem = asyncio.Semaphore(_LLM_TAIL_CONCURRENCY)
 
-    async def _run_sub(n: int, sub: list) -> dict:
+    async def _run_sub(n: int, sub: list) -> tuple[dict, dict]:
         async with sem:
             prompt = _build_llm_prompt(sub, coa_index, language)
+            sub_usage: dict = {}
             try:
-                # Per-sub-batch wall-clock cap so a slow/unresponsive Gemini degrades
+                # Per-sub-batch wall-clock cap so a slow/unresponsive model degrades
                 # to Tier-2 instead of hanging the whole mapping request.
                 result = await asyncio.wait_for(
                     asyncio.to_thread(
                         structured.generate_structured, prompt, _LlmResult,
                         system=_LLM_SYSTEM, max_output_tokens=8192,
+                        tier="smart", usage_out=sub_usage,
                     ),
                     timeout=_LLM_TAIL_TIMEOUT_SEC,
                 )
-            except Exception as exc:  # timeout / quota / network / truncation — degrade
+            except Exception as exc:  # timeout / throttle / network / truncation — degrade
                 logger.warning(
                     "tb-map Tier-3 LLM sub-batch %d/%d unavailable (keeping Tier-2): %s",
                     n + 1, len(subs), exc,
                 )
-                return {}
+                return {}, {}
             res = {}
             for m in result.mappings or []:
                 cid = _to_int(m.coa_original_id)
                 if cid is not None and cid not in valid_ids:
                     cid = None  # never trust an id outside the shortlist/candidate set
                 res[_to_int(m.tb_account_id)] = (cid, m.confidence, m.rationale)
-            return res
+            return res, sub_usage
 
     parts = await asyncio.gather(*[_run_sub(n, sub) for n, sub in enumerate(subs)])
-    out = {}
-    for p in parts:
-        out.update(p)
-    return out
+    out: dict = {}
+    usage = {"input": 0, "output": 0, "model": ""}
+    for res, su in parts:
+        out.update(res)
+        usage["input"] += int(su.get("input", 0) or 0)
+        usage["output"] += int(su.get("output", 0) or 0)
+        if su.get("model"):
+            usage["model"] = su["model"]
+    return out, usage
 
 
 async def map_accounts(
@@ -436,12 +448,16 @@ async def map_accounts(
         results_by_idx[idx] = sugg
 
     # ===== TIER 3 — LLM tail (gated; BLENDS with the provisional Tier-2 guess) =====
-    if use_llm_tail and tail:
+    # Two gates: the feature flag (use_llm_tail) AND the org's AI credit budget.
+    # When the org is over its monthly cap we skip Tier-3 entirely and keep the
+    # deterministic Tier-2 guesses — the same graceful degrade as a throttle
+    # failure, just decided up front (no error to the user).
+    if use_llm_tail and tail and await usage_meter.has_credits(db, organization_id):
         id_to_idx = {a.tb_account_id: idx for (idx, a, _s) in tail}
 
-        # Split the tail into cache hits (zero quota) and misses; only misses go to
-        # Gemini, still as one batched call. A cached `None` pick (LLM abstained) is
-        # honoured too, so we don't re-ask about genuinely-hard accounts.
+        # Split the tail into cache hits (zero spend) and misses; only misses go to
+        # the LLM, still as one batched call. A cached `None` pick (LLM abstained)
+        # is honoured too, so we don't re-ask about genuinely-hard accounts.
         llm: dict = {}
         misses: list = []
         key_by_tbid: dict = {}
@@ -454,12 +470,18 @@ async def map_accounts(
             else:
                 misses.append((idx, a, shortlist))
         if misses:
-            fresh = await _run_llm_tail(misses, coa_index, valid_ids, language)
+            fresh, tail_usage = await _run_llm_tail(misses, coa_index, valid_ids, language)
             for tb_id, val in fresh.items():
                 llm[tb_id] = val
                 k = key_by_tbid.get(tb_id)
                 if k is not None:
                     _LLM_TAIL_CACHE.set(k, val)
+            # Meter the tail's token spend against the org's monthly budget. Cached
+            # picks above cost nothing, so only the fresh sub-batches are charged.
+            await usage_meter.record_usage(
+                db, organization_id=organization_id, user_id=None,
+                feature="tb_tail", tier="smart", usage=tail_usage,
+            )
 
         # Blend each LLM pick with the provisional Tier-2 suggestion instead of a
         # blind override: agreement raises confidence, conflict caps it for review.
@@ -472,5 +494,10 @@ async def map_accounts(
             label = coa_index.get(cid, {}).get("label")
             conf, r = _blend_llm_pick(results_by_idx[idx], cid, llm_conf, rationale, label)
             results_by_idx[idx] = _mk(accounts[idx], cid, conf, "llm", r)
+    elif use_llm_tail and tail:
+        logger.info(
+            "tb-map Tier-3: org %s over its AI budget — keeping Tier-2 for %d accounts",
+            organization_id, len(tail),
+        )
 
     return [results_by_idx[i] for i in range(len(accounts))]

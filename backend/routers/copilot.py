@@ -35,6 +35,7 @@ import schemas
 import structured
 import tb_mapping_engine
 import tb_mapping_memory
+import usage_meter
 from prompts import procedure as procedure_prompt
 from prompts import findings as findings_prompt
 
@@ -86,6 +87,8 @@ async def generate_procedure(
     KB-retrieved standard guidance + the section context the FE supplies."""
     # Auth/session consistency with /ask (anonymous auditai session token).
     await _load_session(db, payload.session_token)
+    # Per-org AI budget gate (HTTP 402 when over). No-op for unmetered/anon orgs.
+    await usage_meter.ensure_credits(db, payload.organization_id)
 
     risks = [r.model_dump() for r in payload.risks]
     query = procedure_prompt.build_retrieval_query(
@@ -136,6 +139,8 @@ async def generate_procedure(
 
     started = time.perf_counter()
     document_filenames = list({c.document_filename for c in chunks})
+    req_id = uuid.uuid4().hex
+    usage: dict = {}
 
     async def event_stream():
         yield json.dumps(
@@ -148,7 +153,7 @@ async def generate_procedure(
 
         try:
             async for piece in structured.astream_text(
-                system, user_prompt, temperature=0.3, max_output_tokens=4096
+                system, user_prompt, temperature=0.3, max_output_tokens=4096, usage_out=usage
             ):
                 cleaned = _strip_fences(piece)
                 if cleaned:
@@ -162,6 +167,10 @@ async def generate_procedure(
             )
             yield json.dumps({"type": "error", "message": message}) + "\n"
 
+        await usage_meter.record_usage(
+            db, organization_id=payload.organization_id, user_id=payload.user_id,
+            feature="procedure", tier="smart", usage=usage, request_id=req_id,
+        )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         yield json.dumps(
             {
@@ -217,6 +226,7 @@ async def generate_findings(
     the audit file's real results (TB figures + sampling) fetched live from
     1audit-be via the copilot grant. Never invents figures (ISA 220)."""
     await _load_session(db, payload.session_token)
+    await usage_meter.ensure_credits(db, payload.organization_id)
 
     ctx = copilot_tools.CopilotContext(payload.audit_file_id, payload.copilot_grant)
     # Fetch the linked account's real results + the file summary (blocking HTTP
@@ -247,6 +257,8 @@ async def generate_findings(
     )
 
     started = time.perf_counter()
+    req_id = uuid.uuid4().hex
+    usage: dict = {}
 
     async def event_stream():
         yield json.dumps(
@@ -271,7 +283,7 @@ async def generate_findings(
 
         try:
             async for piece in structured.astream_text(
-                system, user_prompt, temperature=0.2, max_output_tokens=4096
+                system, user_prompt, temperature=0.2, max_output_tokens=4096, usage_out=usage
             ):
                 cleaned = _strip_fences(piece)
                 if cleaned:
@@ -285,6 +297,10 @@ async def generate_findings(
             )
             yield json.dumps({"type": "error", "message": message}) + "\n"
 
+        await usage_meter.record_usage(
+            db, organization_id=payload.organization_id, user_id=payload.user_id,
+            feature="findings", tier="smart", usage=usage, request_id=req_id,
+        )
         yield json.dumps(
             {
                 "type": "done",
@@ -316,6 +332,8 @@ async def generate_response(
     if not (payload.procedure and payload.procedure.strip()):
         raise HTTPException(status_code=422, detail="procedure text is required")
 
+    await usage_meter.ensure_credits(db, payload.organization_id)
+    usage: dict = {}
     try:
         result = await asyncio.to_thread(
             copilot_tools.respond_to_procedure,
@@ -323,6 +341,7 @@ async def generate_response(
             payload.audit_file_id,
             payload.copilot_grant,
             payload.language,
+            usage_out=usage,
         )
     except Exception as exc:
         logger.exception("Procedure response error: %s", exc)
@@ -338,6 +357,10 @@ async def generate_response(
             status_code=502,
             detail="Could not read this file's data (the copilot grant may have expired). Please try again.",
         )
+    await usage_meter.record_usage(
+        db, organization_id=payload.organization_id, user_id=payload.user_id,
+        feature="respond", tier="smart", usage=usage,
+    )
     return {"answer": answer, "tools_used": result.tools_used}
 
 
@@ -356,6 +379,7 @@ async def chat_about_file(
     answer is Markdown (## Answer + ## Follow-up Questions) for the chat bubble."""
     session = await _load_session(db, payload.session_token)
     started = time.perf_counter()
+    await usage_meter.ensure_credits(db, payload.organization_id)
 
     # A general / knowledge-base question gets the SAME rich answer as the
     # standalone /ask path (qa.answer_question — bold, multi-paragraph, no inline
@@ -389,6 +413,11 @@ async def chat_about_file(
             payload.user_id,
             payload.organization_id,
         )
+        await usage_meter.record(
+            db, organization_id=payload.organization_id, user_id=payload.user_id,
+            feature="chat", tier="smart", model="",
+            input_tokens=qres.prompt_tokens, output_tokens=qres.completion_tokens,
+        )
         return {
             "answer": kb_answer,
             "sources": ["search_standards"],
@@ -411,6 +440,7 @@ async def chat_about_file(
         # tool {"error": ...} rather than crashing the request.
         return fut.result(timeout=_KB_SEARCH_TIMEOUT)
 
+    usage: dict = {}
     try:
         result = await asyncio.to_thread(
             copilot_tools.answer_about_file,
@@ -419,6 +449,7 @@ async def chat_about_file(
             payload.copilot_grant,
             payload.language,
             kb_search=kb_search,
+            usage_out=usage,
         )
     except copilot_tools.CopilotGrantError as exc:
         logger.info("Copilot chat grant rejected: %s", exc)
@@ -460,6 +491,10 @@ async def chat_about_file(
         elapsed_ms,
         payload.user_id,
         payload.organization_id,
+    )
+    await usage_meter.record_usage(
+        db, organization_id=payload.organization_id, user_id=payload.user_id,
+        feature="chat", tier="smart", usage=usage,
     )
     return {"answer": answer, "sources": sources, "history_id": str(history_id)}
 

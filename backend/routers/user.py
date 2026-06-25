@@ -39,6 +39,7 @@ from models import SearchHistory, UserSession
 from rate_limit import limiter
 import qa
 import schemas
+import usage_meter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["user"])
@@ -182,6 +183,9 @@ async def ask(
     _validate_question_payload(payload.question)
     session = await _load_session(db, payload.session_token)
     await _check_session_quota(db, session.id)
+    # Per-org AI budget gate (only enforced when an org id is present; the
+    # anonymous standalone KB still relies on the per-session cap above).
+    await usage_meter.ensure_credits(db, payload.organization_id)
 
     started = time.perf_counter()
     try:
@@ -200,8 +204,8 @@ async def ask(
             raise HTTPException(
                 status_code=429,
                 detail=(
-                    "The AI assistant is temporarily at capacity (daily quota "
-                    "reached). Please try again in a minute."
+                    "The AI assistant is temporarily at capacity. "
+                    "Please try again in a moment."
                 ),
             )
         raise HTTPException(
@@ -226,6 +230,13 @@ async def ask(
         payload.user_id,
         payload.organization_id,
     )
+
+    if payload.organization_id:
+        await usage_meter.record(
+            db, organization_id=payload.organization_id, user_id=payload.user_id,
+            feature="ask", tier="smart", model="",
+            input_tokens=result.prompt_tokens, output_tokens=result.completion_tokens,
+        )
 
     return schemas.AskResponse(
         answer=result.answer,
@@ -267,6 +278,7 @@ async def ask_stream(
     _validate_question_payload(payload.question)
     session = await _load_session(db, payload.session_token)
     await _check_session_quota(db, session.id)
+    await usage_meter.ensure_credits(db, payload.organization_id)
 
     started = time.perf_counter()
     try:
@@ -384,6 +396,20 @@ async def ask_stream(
                 history_id = str(history.id)
         except Exception as exc:
             logger.exception("Failed to persist streamed answer: %s", exc)
+
+        # Meter org-scoped streamed answers against the monthly budget (fresh
+        # session — the request db is closing). No-op for anonymous traffic.
+        if caller_organization_id:
+            try:
+                async with AsyncSessionLocal() as mb:
+                    await usage_meter.record(
+                        mb, organization_id=caller_organization_id, user_id=caller_user_id,
+                        feature="ask", tier="smart", model="",
+                        input_tokens=int(preamble.usage.get("prompt", 0) or 0),
+                        output_tokens=int(preamble.usage.get("completion", 0) or 0),
+                    )
+            except Exception:
+                pass
 
         yield json.dumps(
             {

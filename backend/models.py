@@ -17,11 +17,13 @@ from sqlalchemy import (
     Text,
     Integer,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     BigInteger,
     Index,
     func,
+    text as text_sql,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -293,4 +295,72 @@ class TbMappingMemory(Base):
     __table_args__ = (
         # Fast exact/near lookups by code within an org (Tier-1 "previous data").
         Index("tb_mapping_memory_org_code_idx", "organization_id", "account_code"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Table 8: ai_usage_ledger  — per-call LLM usage (billing source of truth)
+# ---------------------------------------------------------------------------
+class AiUsageLedger(Base):
+    """One append-only row per Bedrock call: which org/feature/tier/model, the
+    token counts, and the normalised credit cost. This is the source of truth
+    for per-org AI spend and analytics (procedure/findings/tb-tail never write
+    to search_history, so the ledger captures every feature uniformly).
+
+    Purely additive: a new table in auditai's own Postgres, never read/written
+    by 1audit. The canonical DDL also lives in
+    migrations/004_ai_credit_metering.sql (used for prod / manual apply)."""
+    __tablename__ = "ai_usage_ledger"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    feature: Mapped[str] = mapped_column(String(32), nullable=False)
+    tier: Mapped[str] = mapped_column(String(16), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    credits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Idempotency key — a retried request with the same id is recorded once.
+    request_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_ai_usage_ledger_org_time", "organization_id", "created_at"),
+        # Partial unique index: idempotency for non-null request ids only.
+        Index(
+            "ux_ai_usage_ledger_request",
+            "request_id",
+            unique=True,
+            postgresql_where=text_sql("request_id IS NOT NULL"),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Table 9: ai_org_quota  — per-org monthly allowance + current-period counter
+# ---------------------------------------------------------------------------
+class AiOrgQuota(Base):
+    """One row per organization holding its monthly AI-credit allowance and a
+    running counter for the current period (reset on the first call of a new
+    month). A denormalised counter so the pre-flight cap check is a single cheap
+    read; the ai_usage_ledger remains the auditable source of truth.
+
+    Orgs with no row fall back to AI_MONTHLY_CREDIT_ALLOWANCE_DEFAULT; a row is
+    created lazily on first use. Purely additive (auditai Postgres only)."""
+    __tablename__ = "ai_org_quota"
+
+    organization_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    monthly_credit_allowance: Mapped[int] = mapped_column(Integer, nullable=False)
+    period_start: Mapped[Any] = mapped_column(Date, nullable=False)
+    credits_used_this_period: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

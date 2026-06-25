@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, List, Optional
 from uuid import UUID
@@ -27,15 +26,13 @@ from sqlalchemy import select, desc, text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import (
-    GEMINI_API_KEY,
-    GEMINI_MODELS,
-    GEMINI_MODEL_COOLDOWN_SEC,
     INITIAL_CANDIDATES,
     TOP_K_CHUNKS,
     SIMILARITY_THRESHOLD,
     CONVERSATION_MEMORY_TURNS,
     USE_RERANKER,
 )
+import llm
 from cache import answer_cache
 from embeddings import embed_queries, embed_query
 from models import DocumentChunk, Document, SearchHistory
@@ -48,75 +45,15 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Gemini clients (per-model, lazily built) + quota-cooldown registry.
-# When a model returns 429 we mark it cooled-down so the next request skips
-# it on first attempt and goes straight to the next model in the chain.
+# LLM calls go through the provider seam in llm.py (AWS Bedrock / Claude), which
+# owns client construction, the smart/fast model tiers, throttle handling, and
+# per-model failover/cooldown. qa.py only builds prompts and maps usage.
 # ---------------------------------------------------------------------------
-_gemini_clients: dict = {}      # model_name -> GenerativeModel
-_gemini_configured: bool = False
-_model_cooldown_until: dict = {}  # model_name -> monotonic seconds
-
-
-def _get_gemini(model_name: str):
-    """Configure and return a Gemini GenerativeModel for a specific name."""
-    global _gemini_configured
-    cached = _gemini_clients.get(model_name)
-    if cached is not None:
-        return cached
-
-    if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set. Get a free key at "
-            "https://aistudio.google.com/apikey and add it to your .env file."
-        )
-
-    try:
-        import google.generativeai as genai
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "google-generativeai is not installed. Run: pip install -r requirements.txt"
-        ) from exc
-
-    if not _gemini_configured:
-        genai.configure(api_key=GEMINI_API_KEY)
-        _gemini_configured = True
-
-    client = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=SYSTEM_PROMPT,
-    )
-    _gemini_clients[model_name] = client
-    return client
-
-
-def _model_order() -> List[str]:
-    """Return GEMINI_MODELS with currently-cooling-down models moved to the
-    end. All models stay in the list so a fully-cooled chain still gets a
-    last-resort try (and surfaces a clean error if every model is exhausted)."""
-    now = time.monotonic()
-    fresh, cooled = [], []
-    for name in GEMINI_MODELS:
-        if _model_cooldown_until.get(name, 0) > now:
-            cooled.append(name)
-        else:
-            fresh.append(name)
-    return fresh + cooled
-
-
-def _mark_quota_exhausted(model_name: str) -> None:
-    _model_cooldown_until[model_name] = time.monotonic() + GEMINI_MODEL_COOLDOWN_SEC
-    logger.info(
-        "Gemini model %s hit quota — cooling down for %ds",
-        model_name,
-        GEMINI_MODEL_COOLDOWN_SEC,
-    )
 
 
 # ---------------------------------------------------------------------------
-# Translation — separate Gemini client (no audit system prompt)
+# Translation — fast tier, dedicated system prompt (no audit system prompt)
 # ---------------------------------------------------------------------------
-_translate_client = None
-
 _TRANSLATE_SYSTEM_PROMPT = (
     "You are a precise translation engine. Translate the user's text into the "
     "requested target language exactly. Preserve all markdown formatting "
@@ -126,40 +63,19 @@ _TRANSLATE_SYSTEM_PROMPT = (
 )
 
 
-def _get_translate_client():
-    """Lazily build a Gemini client dedicated to translation (no audit system prompt)."""
-    global _translate_client, _gemini_configured
-    if _translate_client is not None:
-        return _translate_client
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not set.")
-    try:
-        import google.generativeai as genai
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "google-generativeai is not installed. Run: pip install -r requirements.txt"
-        ) from exc
-    if not _gemini_configured:
-        genai.configure(api_key=GEMINI_API_KEY)
-        _gemini_configured = True
-    _translate_client = genai.GenerativeModel(
-        model_name=GEMINI_MODELS[0],
-        system_instruction=_TRANSLATE_SYSTEM_PROMPT,
-    )
-    return _translate_client
-
-
 async def translate_text(text: str, target_language: str) -> str:
-    """Translate text to 'en' or 'ar' via Gemini. Preserves markdown."""
+    """Translate text to 'en' or 'ar' via Bedrock (fast tier). Preserves markdown."""
     target_name = "Arabic" if target_language == "ar" else "English"
     prompt = f"Translate the following text to {target_name}:\n\n{text}"
-    model = _get_translate_client()
-    response = await asyncio.to_thread(
-        model.generate_content,
+    result = await asyncio.to_thread(
+        llm.complete_text,
+        _TRANSLATE_SYSTEM_PROMPT,
         prompt,
-        generation_config={"temperature": 0.1, "max_output_tokens": 4000},
+        tier="fast",
+        temperature=0.1,
+        max_tokens=4000,
     )
-    return (_extract_text(response) or "").strip()
+    return (result.text or "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -320,24 +236,30 @@ SYSTEM_PROMPT = """You are AuditAI, a senior audit knowledge assistant for profe
 Your response MUST use exactly these two sections in this order:
 
 ## From your knowledge base
-- Use ONLY the provided KNOWLEDGE BASE CONTEXT to write this section.
+- Ground 1audit product help and any client/file-specific facts STRICTLY in the provided KNOWLEDGE BASE CONTEXT. General auditing, accounting, assurance, tax and financial-reporting concepts may additionally draw on your own professional knowledge — see the coverage rule below.
 - Start with a direct one-line answer to the question.
 - Use `##` sub-headings to organize multi-part answers when helpful.
 - Use **bold** for key terms, standard names (e.g., **ISA 315**), thresholds, and important figures.
 - Answer directly and naturally, as the 1audit assistant speaking to the user. Do NOT reveal where the answer came from or how it was produced — never write "According to the documentation", "According to the 1Audit system documentation", "As stated in the provided/uploaded guidelines", "based on the provided context", "per the knowledge base", or any similar source reference. You MAY name a specific standard when it is genuinely part of the answer (e.g. "**ISA 315** requires…"), but never refer to "the documentation", "the system documentation", or the source material itself.
 - Keep paragraphs short — 2-3 sentences each.
-- If the provided context does NOT contain a useful answer, write EXACTLY this (replace all other content in this section, do NOT add a Follow-up Questions section):
+- Match your answer to how well the KNOWLEDGE BASE CONTEXT covers the question:
+    - If the context fully answers it, answer from the context.
+    - If the context is on-topic but only PARTIALLY covers the question, answer the part it DOES support — strictly from the context — then add one short sentence noting what the knowledge base does not cover.
+    - If the context does NOT cover it but the question is a GENERAL auditing, accounting, assurance, tax or financial-reporting concept, standard or definition, answer it from your own professional knowledge. Begin the section with this EXACT italic line, then give a concise, accurate answer:
+      *General guidance — verify against the standard.*
+    - Otherwise — the question asks about 1audit product behaviour the context does not cover, asks for a specific audit file's figures, or is outside auditing/accounting/finance — write EXACTLY this (replace all other content in this section, and do NOT add a Follow-up Questions section):
 
     I'm sorry. I'm unable to help you with your query.
 
     Feel free to email us directly at **info@1audit.com**
 
     Or call us at **+966 920 035 129**
+- NEVER use general knowledge to state 1audit product behaviour, or any figure, balance, name or date about a specific audit file — those come from the KNOWLEDGE BASE CONTEXT only.
 
 ## Follow-up Questions
 Generate EXACTLY three short follow-up questions the user is likely to ask next, given the topic and what is available in the knowledge base context. Output them as a plain bullet list with `-`, one question per line, no extra commentary. Each question must:
 - Be a natural next step or deeper dive on the same topic
-- Be answerable using the same or related parts of the knowledge base (don't suggest topics that aren't there)
+- Be answerable from the knowledge base, or — for a general-guidance answer — from the same professional topic
 - Be 4-12 words long, phrased as a real question ending with `?`
 - NOT repeat the user's current question
 - NOT include numbering, prefixes like "Q:", or bold formatting
@@ -380,8 +302,8 @@ FORMATTING RULES (apply throughout):
 6. **Inline code** (backticks) for account codes, formulas, or technical identifiers (e.g., `1000 Cash`, `=AVG(B2:B12)`).
 
 Hard rules:
-- Do NOT include an "Additional context" section. Do NOT add background, general knowledge, or supplementary explanations beyond what is in the provided context.
-- NEVER fabricate facts. Everything in "From your knowledge base" must trace back to the provided context.
+- Do NOT include an "Additional context" section, and do not pad a context-grounded answer with unrelated general knowledge. (Answering a general professional concept from your own knowledge under the coverage rule above is allowed and is not padding.)
+- NEVER fabricate. Product-help and file-specific facts must trace to the provided context; general professional guidance must be accurate and standard-consistent. If you are unsure, say so rather than guess.
 - NEVER include inline source citations such as [Source 1], [Source 6, Page 135; Source 7, Page 141], (Source 2), [Page 5], [Sources: 1, 2, 3], or any bracketed/parenthesised reference markers.
 - If a previous Q&A in the conversation provides context for a follow-up ("what about...", "and the threshold?"), treat it as continuation of the same topic.
 - Output must be valid Markdown. Be concise — aim for the shortest answer that is complete and accurate.
@@ -710,8 +632,10 @@ def _build_user_prompt(
     history: List[SearchHistory],
     language: str = "en",
 ) -> str:
-    # Use plain separators (no brackets) so the model is not tempted to
-    # echo "[Source N]" style references back into its answer.
+    # Claude grounds most reliably when source material is delimited with XML
+    # tags. The system prompt forbids source citations and a post-process strips
+    # any that leak, so tagging is safe — Claude does not echo structural tags
+    # into prose the way bracketed "[Source N]" markers used to invite.
     context_blocks: List[str] = []
     for i, c in enumerate(chunks, start=1):
         loc_parts = []
@@ -723,22 +647,22 @@ def _build_user_prompt(
             loc_parts.append("table")
         loc = f" ({', '.join(loc_parts)})" if loc_parts else ""
         context_blocks.append(
-            f"--- Excerpt {i} from {c.document_filename}{loc} ---\n{c.content}"
+            f'<excerpt id="{i}" source="{c.document_filename}{loc}">\n{c.content}\n</excerpt>'
         )
     context_text = (
-        "\n\n".join(context_blocks) if context_blocks else "(no context available)"
+        "\n".join(context_blocks) if context_blocks else "(no context available)"
     )
 
     return (
         f"{_language_instruction(language)}"
         f"{_format_history(history)}"
-        "Answer the question below using ONLY the KNOWLEDGE BASE CONTEXT. "
+        "Answer the question using ONLY the facts inside <knowledge_base> below. "
         "Output exactly two sections: '## From your knowledge base' and "
         "'## Follow-up Questions' (3 bullets). Do not add any other sections.\n\n"
-        "=== KNOWLEDGE BASE CONTEXT ===\n"
+        "<knowledge_base>\n"
         f"{context_text}\n"
-        "=== END CONTEXT ===\n\n"
-        f"Current question: {question}"
+        "</knowledge_base>\n\n"
+        f"<question>{question}</question>"
     )
 
 
@@ -767,50 +691,23 @@ def _empty_kb_text(language: str) -> str:
 # ---------------------------------------------------------------------------
 # Single-shot answer (non-streaming) — kept for /ask compatibility
 # ---------------------------------------------------------------------------
-def _extract_text(response) -> str:
-    try:
-        return (response.text or "").strip()
-    except Exception:
-        parts = []
-        for cand in getattr(response, "candidates", []) or []:
-            for part in getattr(cand.content, "parts", []) or []:
-                if getattr(part, "text", None):
-                    parts.append(part.text)
-        return "\n".join(parts).strip()
-
-
-def _call_gemini_sync(prompt: str) -> tuple[str, dict]:
-    """Return (text, usage). Iterates through GEMINI_MODELS in priority
-    order, falling back to the next model on quota errors. Raises the last
-    exception if every model is exhausted."""
-    order = _model_order()
-    last_exc: Optional[Exception] = None
-    primary = order[0]
-    for name in order:
-        try:
-            model = _get_gemini(name)
-            response = model.generate_content(
-                prompt,
-                generation_config={"temperature": 0.2, "max_output_tokens": 1000},
-            )
-        except Exception as exc:
-            if is_quota_error(exc):
-                _mark_quota_exhausted(name)
-                last_exc = exc
-                continue
-            raise
-        um = getattr(response, "usage_metadata", None)
-        usage = {
-            "prompt":     int(getattr(um, "prompt_token_count", 0) or 0),
-            "completion": int(getattr(um, "candidates_token_count", 0) or 0),
-            "total":      int(getattr(um, "total_token_count", 0) or 0),
-        }
-        if name != primary:
-            logger.info("Gemini fell back from %s to %s", primary, name)
-        return _extract_text(response), usage
-    # Every model returned a quota error.
-    assert last_exc is not None
-    raise last_exc
+def _call_llm_sync(prompt: str) -> tuple[str, dict]:
+    """Return (text, usage) for a single-shot answer on the smart tier. Bedrock
+    model selection / failover lives in llm.py. Usage keys are
+    prompt/completion/total to match the SearchHistory columns."""
+    result = llm.complete_text(
+        SYSTEM_PROMPT,
+        prompt,
+        tier="smart",
+        temperature=0.2,
+        max_tokens=1000,
+    )
+    usage = {
+        "prompt":     result.usage.input_tokens,
+        "completion": result.usage.output_tokens,
+        "total":      result.usage.input_tokens + result.usage.output_tokens,
+    }
+    return result.text, usage
 
 
 async def answer_question(
@@ -852,15 +749,12 @@ async def answer_question(
     )
     history = await load_recent_history(db, session_id)
 
-    if not chunks:
-        return QAResult(
-            answer=_empty_kb_text(language),
-            was_answered=False,
-            question_embedding=question_embedding,
-        )
-
-    confidence, top_similarity = _confidence_score(chunks)
-    kb_has_signal = confidence >= CONFIDENCE_THRESHOLD
+    # No retrieved context does NOT end the turn: the model may still answer a
+    # GENERAL professional concept from its own knowledge. Per the system prompt
+    # it emits the canned decline for product-specific, file-specific or
+    # out-of-scope questions, so we let every question reach the model.
+    confidence, top_similarity = _confidence_score(chunks) if chunks else (0.0, 0.0)
+    kb_has_signal = bool(chunks) and confidence >= CONFIDENCE_THRESHOLD
     logger.debug(
         "Confidence %.3f (top_sim=%.3f, top_rerank=%.3f, distinct_docs=%d) — signal=%s",
         confidence,
@@ -872,7 +766,7 @@ async def answer_question(
 
     prompt = _build_user_prompt(question, chunks, history, language=language)
     try:
-        answer_text, llm_usage = await asyncio.to_thread(_call_gemini_sync, prompt)
+        answer_text, llm_usage = await asyncio.to_thread(_call_llm_sync, prompt)
         if not answer_text:
             answer_text = _empty_kb_text(language)
     except RuntimeError:
@@ -884,23 +778,29 @@ async def answer_question(
     # Strip any inline source citations the model may have produced.
     answer_text = strip_inline_citations(answer_text)
 
-    # Detect no-answer phrasings and FORCE the canonical contact-us message.
-    # This guarantees the user always sees the same polished message.
-    if looks_like_no_answer(answer_text, language) or not kb_has_signal:
+    # Trust the model's own decision: per the system prompt it emits the canned
+    # decline text when it cannot answer (caught by looks_like_no_answer). We no
+    # longer force-decline merely because KB retrieval was weak — that would
+    # suppress valid general-professional-knowledge answers.
+    if looks_like_no_answer(answer_text, language):
         answer_text = _empty_kb_text(language)
         was_answered = False
     else:
         was_answered = True
 
+    # A strong-signal KB answer carries its sources; a general-guidance answer
+    # (answered despite weak/no KB signal) cites none.
+    grounded = was_answered and kb_has_signal
+
     result = QAResult(
         answer=answer_text,
         was_answered=was_answered,
-        chunks_used=[str(c.chunk_id) for c in chunks],
-        documents_referenced=list({str(c.document_id) for c in chunks}),
-        document_filenames=list({c.document_filename for c in chunks}),
-        similarity_scores=[round(c.similarity, 4) for c in chunks],
+        chunks_used=[str(c.chunk_id) for c in chunks] if grounded else [],
+        documents_referenced=list({str(c.document_id) for c in chunks}) if grounded else [],
+        document_filenames=list({c.document_filename for c in chunks}) if grounded else [],
+        similarity_scores=[round(c.similarity, 4) for c in chunks] if grounded else [],
         question_embedding=question_embedding,
-        sources=_build_sources(chunks) if was_answered else [],
+        sources=_build_sources(chunks) if grounded else [],
         confidence=round(confidence, 4),
         prompt_tokens=int(llm_usage.get("prompt", 0)),
         completion_tokens=int(llm_usage.get("completion", 0)),
@@ -1009,17 +909,10 @@ async def prepare_stream(
 
 
 def is_quota_error(exc: Exception) -> bool:
-    """True if exc looks like a Gemini quota / rate-limit (HTTP 429) error.
-    Matches both the typed `google.api_core.exceptions.ResourceExhausted` and
-    the string form so we stay robust across SDK versions."""
-    name = type(exc).__name__
-    msg = str(exc)
-    return (
-        name == "ResourceExhausted"
-        or "RESOURCE_EXHAUSTED" in msg
-        or "quota" in msg.lower()
-        or msg.startswith("429 ")
-    )
+    """True if exc looks like an LLM throttle / rate-limit (HTTP 429) error.
+    Kept under the historical name for callers (routers); delegates to the
+    provider seam (llm.is_throttle_error)."""
+    return llm.is_throttle_error(exc)
 
 
 def friendly_llm_error(exc: Exception) -> str:
@@ -1027,88 +920,35 @@ def friendly_llm_error(exc: Exception) -> str:
     a markdown italic block so it stands out against the answer body."""
     if is_quota_error(exc):
         return (
-            "⚠️ The AI assistant is temporarily at capacity (daily quota reached). Please try again in a minute."
+            "⚠️ The AI assistant is temporarily at capacity. Please try again in a moment."
         )
     return (
         "\n\n_⚠️ I couldn't finish generating a response. Please try again._"
     )
 
 
-def _chunk_text(ev) -> str:
-    try:
-        return ev.text or ""
-    except Exception:
-        t = ""
-        for cand in getattr(ev, "candidates", []) or []:
-            for part in getattr(cand.content, "parts", []) or []:
-                if getattr(part, "text", None):
-                    t += part.text
-        return t
-
-
-def _capture_usage(stream, last_ev, usage_out: dict) -> None:
-    """Prefer the aggregated total on the stream object; fall back to the
-    last chunk's usage_metadata."""
-    for source in (stream, last_ev):
-        um = getattr(source, "usage_metadata", None) if source is not None else None
-        total = int(getattr(um, "total_token_count", 0) or 0)
-        if total > 0:
-            usage_out["prompt"]     = int(getattr(um, "prompt_token_count", 0) or 0)
-            usage_out["completion"] = int(getattr(um, "candidates_token_count", 0) or 0)
-            usage_out["total"]      = total
-            return
-
-
-def _stream_gemini_sync(prompt: str, usage_out: Optional[dict] = None):
-    """Yields successive text chunks from Gemini, with model fallback.
-    Fallback only kicks in BEFORE the first chunk is yielded; once content
-    has reached the user, a mid-stream quota error falls through to the
-    producer's friendly-error path rather than silently swapping models
-    (which would lose the partial answer)."""
-    order = _model_order()
-    last_exc: Optional[Exception] = None
-    primary = order[0]
-    for name in order:
-        try:
-            model = _get_gemini(name)
-            response_stream = model.generate_content(
-                prompt,
-                generation_config={"temperature": 0.2, "max_output_tokens": 1000},
-                stream=True,
-            )
-            iterator = iter(response_stream)
-            # Eagerly pull the first chunk — this is when the SDK actually
-            # contacts the API and raises 429 if the quota is gone.
-            first_ev = next(iterator)
-        except StopIteration:
-            # Model returned zero chunks; not technically quota, but no
-            # answer either — try the next model.
-            continue
-        except Exception as exc:
-            if is_quota_error(exc):
-                _mark_quota_exhausted(name)
-                last_exc = exc
-                continue
-            raise
-        # Past this point we commit to this model. Mid-stream failures
-        # propagate to the caller (producer in stream_answer).
-        if name != primary:
-            logger.info("Gemini fell back from %s to %s", primary, name)
-        last_ev = first_ev
-        t = _chunk_text(first_ev)
-        if t:
-            yield t
-        for ev in iterator:
-            last_ev = ev
-            t = _chunk_text(ev)
-            if t:
-                yield t
-        if usage_out is not None:
-            _capture_usage(response_stream, last_ev, usage_out)
-        return
-    # Every model returned a quota error before producing any text.
-    assert last_exc is not None
-    raise last_exc
+def _stream_llm_sync(prompt: str, usage_out: Optional[dict] = None):
+    """Yield successive text chunks for a streamed answer on the smart tier.
+    Bedrock model selection / failover lives in llm.py; failover only happens
+    before the first chunk, so a mid-stream throttle propagates to the
+    producer's friendly-error path. ``usage_out`` (if given) is filled with
+    prompt/completion/total to match the SearchHistory columns."""
+    inner: dict = {}
+    for piece in llm.stream_text(
+        SYSTEM_PROMPT,
+        prompt,
+        tier="smart",
+        temperature=0.2,
+        max_tokens=1000,
+        usage_out=inner,
+    ):
+        yield piece
+    if usage_out is not None and inner:
+        in_tok = int(inner.get("input", 0))
+        out_tok = int(inner.get("output", 0))
+        usage_out["prompt"] = in_tok
+        usage_out["completion"] = out_tok
+        usage_out["total"] = in_tok + out_tok
 
 
 async def stream_answer(
@@ -1142,10 +982,9 @@ async def stream_answer(
             await asyncio.sleep(0.005)
         return
 
-    if not preamble.chunks:
-        yield _empty_kb_text(preamble.language)
-        return
-
+    # Empty retrieval does NOT end the turn — the model may still answer a
+    # general professional concept from its own knowledge (or emit the canned
+    # decline, which the probe-and-decide below swaps in). Mirrors answer_question.
     prompt = _build_user_prompt(
         question, preamble.chunks, preamble.history, language=preamble.language,
     )
@@ -1156,7 +995,7 @@ async def stream_answer(
 
     def producer():
         try:
-            for piece in _stream_gemini_sync(prompt, usage_out=preamble.usage):
+            for piece in _stream_llm_sync(prompt, usage_out=preamble.usage):
                 asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
         except Exception as exc:
             logger.error("Gemini streaming error: %s", exc)

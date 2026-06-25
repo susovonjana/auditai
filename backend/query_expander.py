@@ -18,7 +18,7 @@ Design:
     deterministic enough that paraphrases of the same query hit cache.
   - Skips expansion entirely for very long questions (already specific) and
     when USE_QUERY_EXPANSION is false (kill-switch).
-  - Reuses qa._get_gemini() so we don't reinstantiate the model.
+  - Calls the cheap "fast" model tier via llm.py (rephrasing is low-value work).
 """
 from __future__ import annotations
 
@@ -124,22 +124,20 @@ def _parse_rewrites(text: str, n: int) -> List[str]:
     return out
 
 
-def _call_gemini_sync(prompt: str) -> str:
-    """Sync call — imported lazily to avoid circular imports with qa.py."""
-    from qa import _get_gemini, _model_order  # local import: qa imports this module too
+def _call_llm_sync(prompt: str) -> str:
+    """Sync call to the fast model tier for query rephrasing. Provider/model
+    selection lives in llm.py; no system prompt (the instruction is in the
+    user prompt). Returns '' on empty output so expansion degrades gracefully."""
+    import llm  # local import keeps the import graph flat
 
-    # _get_gemini now REQUIRES a model name (multi-model failover, P-1). Pick the
-    # first non-cooled model, matching how qa.py selects one. Without this the
-    # call raised TypeError and expansion silently fell back to single-query.
-    model = _get_gemini(_model_order()[0])
-    resp = model.generate_content(
+    result = llm.complete_text(
+        None,
         prompt,
-        generation_config={
-            "temperature": 0.4,
-            "max_output_tokens": 256,
-        },
+        tier="fast",
+        temperature=0.4,
+        max_tokens=256,
     )
-    return getattr(resp, "text", "") or ""
+    return result.text or ""
 
 
 async def expand_query(
@@ -170,7 +168,7 @@ async def expand_query(
     prompt = _build_prompt(original, n, language)
     try:
         raw = await asyncio.wait_for(
-            asyncio.to_thread(_call_gemini_sync, prompt),
+            asyncio.to_thread(_call_llm_sync, prompt),
             timeout=_EXPANSION_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError:

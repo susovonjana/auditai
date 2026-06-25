@@ -2,9 +2,12 @@
 Central configuration loader.
 Reads environment variables from .env and exposes them as constants.
 
-FREE STACK:
-  - LLM:        Google Gemini API (gemini-flash-latest, with model failover)
-  - Embeddings: sentence-transformers locally (bge-small-en-v1.5, 384-dim)
+STACK:
+  - LLM:        AWS Bedrock (Claude) — tiered: a Haiku-class "fast" model for
+                cheap high-frequency calls, a Sonnet-class "smart" model for
+                generation/chat/TB-tail. Auth via the standard AWS credential
+                chain (access keys locally, the ECS task role in prod).
+  - Embeddings: sentence-transformers locally (multilingual-e5-small, 384-dim)
 """
 import os
 from pathlib import Path
@@ -24,13 +27,15 @@ _env_file = BASE_DIR / (f".env.{_env_name}" if _env_name else ".env")
 # restarting would silently keep using the old baked value.
 load_dotenv(_env_file, override=True)
 
-# --- AI provider keys ---
-# Only Gemini is required in the free stack
-GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-
-# Legacy paid providers — only used if you switch back manually
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+# --- AWS Bedrock (LLM provider) ---
+# Region the Bedrock runtime lives in. Defaults to AWS_REGION (the standard
+# variable boto3 reads) and falls back to eu-west-1 (same region as the RDS).
+BEDROCK_REGION: str = os.getenv("AWS_REGION") or os.getenv("BEDROCK_REGION") or "eu-west-1"
+# Credentials are NOT read here — the AnthropicBedrock client resolves them via
+# the standard AWS chain: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (set in
+# .env.local for dev) or the ECS task role in production. We only surface a
+# boolean for a clean "creds missing" diagnostic at call time.
+HAS_AWS_STATIC_KEYS: bool = bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
 
 # --- Database ---
 DATABASE_URL: str = os.getenv(
@@ -114,25 +119,43 @@ _upload_dir = os.getenv("UPLOAD_DIR", "uploads")
 UPLOAD_DIR: Path = Path(_upload_dir) if os.path.isabs(_upload_dir) else BASE_DIR / _upload_dir
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Models ---
-# Gemini (LLM). Comma-separated list of model names for failover when one
-# model hits its per-day free-tier quota. Tried in order; left-most first.
-# A single value (no comma) keeps the original single-model behaviour.
-# NOTE: gemini-2.0-flash was retired by Google (2026-06-01). Default to the
-# resilient `gemini-flash-latest` alias (always points at the current flash
-# model) with versioned fallbacks. Override via the GEMINI_MODEL env var.
-GEMINI_MODEL_RAW: str = os.getenv(
-    "GEMINI_MODEL", "gemini-flash-latest,gemini-2.5-flash,gemini-2.5-flash-lite"
+# --- Models (AWS Bedrock / Claude) ---
+# Two cost tiers. Each is a comma-separated failover list (left-most first):
+# when a model throttles (Bedrock 429), the next id is tried, then it cools
+# down briefly so later requests skip straight past it.
+#   * SMART — generation, chat, TB Tier-3 (quality-sensitive, lower volume)
+#   * FAST  — intent classify, query expansion, translation (cheap, high volume)
+# Use cross-region INFERENCE-PROFILE ids (the "eu." prefix) so capacity is
+# pooled across EU regions. Defaults below are Sonnet 4.5 (smart) and Haiku 4.5
+# (fast) — verified ACTIVE in eu-west-1. To change, pick another ACTIVE profile
+# from `aws bedrock list-inference-profiles --region eu-west-1` and ensure the
+# IAM principal (local) or ECS task role (prod) has bedrock:InvokeModel* for it.
+def _model_list(raw: str, fallback: str) -> list[str]:
+    return [m.strip() for m in raw.split(",") if m.strip()] or [fallback]
+
+BEDROCK_MODEL_SMART_RAW: str = os.getenv(
+    "BEDROCK_MODEL_SMART", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
 )
-GEMINI_MODELS: list[str] = [m.strip() for m in GEMINI_MODEL_RAW.split(",") if m.strip()] or [
-    "gemini-flash-latest"
-]
-# Kept for callers that still import the original constant; points at the
-# primary (left-most) model.
-GEMINI_MODEL: str = GEMINI_MODELS[0]
-# How long (seconds) to skip a model after it returns a quota error, so
-# subsequent requests jump straight to the next model in the chain.
-GEMINI_MODEL_COOLDOWN_SEC: int = int(os.getenv("GEMINI_MODEL_COOLDOWN_SEC", "600"))
+BEDROCK_MODEL_FAST_RAW: str = os.getenv(
+    "BEDROCK_MODEL_FAST", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+BEDROCK_MODELS_SMART: list[str] = _model_list(
+    BEDROCK_MODEL_SMART_RAW, "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+)
+BEDROCK_MODELS_FAST: list[str] = _model_list(
+    BEDROCK_MODEL_FAST_RAW, "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+# Map a tier name -> its failover list (llm.py reads this).
+BEDROCK_TIER_MODELS: dict[str, list[str]] = {
+    "smart": BEDROCK_MODELS_SMART,
+    "fast": BEDROCK_MODELS_FAST,
+}
+# Seconds to skip a model after it throttles, so the next request jumps to the
+# next id in that tier's chain.
+BEDROCK_MODEL_COOLDOWN_SEC: int = int(os.getenv("BEDROCK_MODEL_COOLDOWN_SEC", "60"))
+# Per-call retry budget for transient Bedrock throttling before giving up on a
+# model and failing over to the next in the tier.
+BEDROCK_MAX_RETRIES: int = int(os.getenv("BEDROCK_MAX_RETRIES", "2"))
 
 # Local embeddings (sentence-transformers)
 # multilingual-e5-small is 384-dim and multilingual (~100 langs incl. Arabic),
@@ -190,6 +213,41 @@ RATE_LIMIT_TRANSLATE: str = os.getenv("RATE_LIMIT_TRANSLATE", "60/hour;500/day")
 MAX_QUESTIONS_PER_SESSION_DAY: int = int(
     os.getenv("MAX_QUESTIONS_PER_SESSION_DAY", "100")
 )
+
+# --- Per-organization AI usage metering + monthly credit cap ---
+# Bedrock is pay-per-token with no free-tier ceiling, so each org gets a monthly
+# "AI credit" budget. Credits are a normalised, model-weighted unit decoupled
+# from raw $ (so price changes don't touch balances and credits stay sellable):
+#   1 credit ≈ $0.001 (one milli-dollar). Each call costs
+#       ceil(input_tokens/1000 * IN_rate + output_tokens/1000 * OUT_rate)
+#   where the per-1k rates below mirror Bedrock's input/output prices per tier.
+# Metering writes an append-only ledger row + bumps the org's period counter;
+# enforcement gates the 3 user-facing features (procedure/findings/chat) at 402,
+# degrades the TB Tier-3 tail to Tier-2, and skips the cheap helpers when over.
+AI_USAGE_METERING_ENABLED: bool = os.getenv("AI_USAGE_METERING_ENABLED", "true").lower() == "true"
+# Master enforcement switch. false = still meter (write the ledger) but never
+# block — useful to observe real usage before turning the cap on.
+AI_CREDIT_CAP_ENABLED: bool = os.getenv("AI_CREDIT_CAP_ENABLED", "true").lower() == "true"
+# Default monthly allowance for an org with no explicit ai_org_quota row.
+# 50000 credits ≈ $50/month. Tune per deployment; per-org overrides live in DB.
+AI_MONTHLY_CREDIT_ALLOWANCE_DEFAULT: int = int(
+    os.getenv("AI_MONTHLY_CREDIT_ALLOWANCE_DEFAULT", "50000")
+)
+# Block once remaining credits fall to/below this floor (0 = allow until empty).
+AI_CREDIT_FLOOR: int = int(os.getenv("AI_CREDIT_FLOOR", "0"))
+# Short TTL (seconds) for the cached per-org remaining-credit read, so a burst of
+# requests doesn't hit the DB for every pre-flight check. Kept small so a newly
+# exhausted org is blocked within the window.
+AI_CREDIT_BALANCE_CACHE_TTL_SEC: int = int(os.getenv("AI_CREDIT_BALANCE_CACHE_TTL_SEC", "20"))
+# Per-tier credit rates (credits per 1,000 tokens), mirroring Bedrock $/1k.
+AI_CREDITS_SMART_IN_PER_1K: float = float(os.getenv("AI_CREDITS_SMART_IN_PER_1K", "3.0"))
+AI_CREDITS_SMART_OUT_PER_1K: float = float(os.getenv("AI_CREDITS_SMART_OUT_PER_1K", "15.0"))
+AI_CREDITS_FAST_IN_PER_1K: float = float(os.getenv("AI_CREDITS_FAST_IN_PER_1K", "0.8"))
+AI_CREDITS_FAST_OUT_PER_1K: float = float(os.getenv("AI_CREDITS_FAST_OUT_PER_1K", "4.0"))
+AI_CREDIT_TIER_RATES: dict[str, tuple[float, float]] = {
+    "smart": (AI_CREDITS_SMART_IN_PER_1K, AI_CREDITS_SMART_OUT_PER_1K),
+    "fast": (AI_CREDITS_FAST_IN_PER_1K, AI_CREDITS_FAST_OUT_PER_1K),
+}
 
 # --- Security: file encryption at rest ---
 # 32 random URL-safe base64 chars. Generated with:

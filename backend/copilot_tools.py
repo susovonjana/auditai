@@ -375,11 +375,13 @@ SYSTEM_FILE_ANSWER = (
     "a typical value. If the tool returns an error or has no value for what was "
     "asked, say plainly you could not retrieve it (and, if useful, where it is "
     "set) — NEVER guess or invent a value. Every file-specific number, name and "
-    "date in your answer must trace to a tool result. For general questions, "
-    "prefer the search_standards passages and cite the source document; if "
-    "nothing relevant is returned and it is a pure concept, you may answer "
-    "briefly from general audit knowledge, but never fabricate file-specific "
-    "facts.\n\n"
+    "date in your answer must trace to a tool result. For GENERAL "
+    "auditing / accounting / standards questions, prefer the search_standards "
+    "passages. If they do not cover it but it is a general professional "
+    "concept, answer from your own professional knowledge and open that answer "
+    "with the italic line '*General guidance — verify against the standard.*' — "
+    "but NEVER use general knowledge for this file's figures or "
+    "for 1audit product behaviour, and never fabricate file-specific facts.\n\n"
     "OUTPUT FORMAT — your FINAL reply must be Markdown with these two sections, "
     "and keep BOTH headers exactly in English even when you answer in another "
     "language:\n"
@@ -420,6 +422,7 @@ def answer_about_file(
     language: str = "en",
     base_url: Optional[str] = None,
     kb_search: Optional[Callable[[str], Any]] = None,
+    usage_out: Optional[dict] = None,
 ) -> ToolLoopResult:
     """Answer a question about the given audit file via the tool-calling loop.
     When ``kb_search`` is supplied the model also gets search_standards, so it
@@ -442,7 +445,8 @@ def answer_about_file(
     # file's data, so make the model fetch with a tool before it may answer —
     # never let it guess a figure/date or just say it will look it up.
     return run_tool_loop(
-        SYSTEM_FILE_ANSWER, user, specs, impls, max_steps=6, force_first_call=True
+        SYSTEM_FILE_ANSWER, user, specs, impls, max_steps=6,
+        force_first_call=True, usage_out=usage_out,
     )
 
 
@@ -493,6 +497,7 @@ def needs_file_data(question: str) -> bool:
             system=_INTENT_SYSTEM,
             temperature=0.0,
             max_output_tokens=256,
+            tier="fast",  # cheap routing decision — use the Haiku-class model
         )
         return bool(res.needs_file_data)
     except Exception as exc:  # pragma: no cover - defensive
@@ -525,10 +530,20 @@ RESPONSE_SYSTEM_PROMPT = (
     "3. SUBSTANTIVE TEST but the tools show NO results were recorded: briefly "
     "state the work still to be performed — do NOT claim it was done, do NOT "
     "write 'no exceptions', do NOT fabricate.\n"
-    "If the tools do not contain the answer, say so plainly.\n"
-    "Output ONLY clean semantic HTML (<p>, <ul>, <ol>, <li>, <strong>, <em>) — "
-    "no markdown, no code fences, no preamble. Be concise. End with a brief "
-    "italic note that this is an AI-generated."
+    "If the tools do not contain the answer, say so plainly.\n\n"
+    "ANSWER QUALITY:\n"
+    "- Answer the EXACT thing the procedure asks. State each figure with the "
+    "account name + code, the period (label current year vs prior year), and the "
+    "currency.\n"
+    "- ADAPT THE DEPTH to the procedure: for a simple lookup give just the "
+    "value(s) tightly, no padding; for a comparison / variance / analytical "
+    "procedure add ONE short grounded line on the size and direction of the "
+    "change and why it may matter — never speculate beyond the figures.\n"
+    "- Bold the key figures and values with <strong>.\n\n"
+    "OUTPUT: ONLY clean semantic HTML using <p>, <ul>, <ol>, <li>, <strong>, "
+    "<em> — no markdown, no code fences, and NO preamble or lead-in sentence: "
+    "begin your reply with the first HTML tag and nothing before it. Do NOT add "
+    "any 'AI-generated' disclaimer line — the app marks AI content itself."
 )
 
 
@@ -538,6 +553,7 @@ def respond_to_procedure(
     grant: str,
     language: str = "en",
     base_url: Optional[str] = None,
+    usage_out: Optional[dict] = None,
 ) -> ToolLoopResult:
     """Draft the auditor's response to a procedure via the tool-calling loop,
     grounded only in the file's real data. Returns ToolLoopResult(answer,
@@ -546,10 +562,11 @@ def respond_to_procedure(
     impls = build_tool_impls(ctx)
     lang_name = "Arabic" if language == "ar" else "English"
     user = (
-        f"Audit procedure:\n{procedure}\n\n"
-        f"Draft the auditor's response to this procedure in {lang_name}, using "
-        f"the file's real data."
+        f"<procedure>\n{procedure}\n</procedure>\n\n"
+        f"Draft the auditor's response to the procedure above in {lang_name}, "
+        f"using this file's real data fetched through the tools."
     )
     return run_tool_loop(
-        RESPONSE_SYSTEM_PROMPT, user, TOOL_SPECS, impls, max_steps=6, force_first_call=True
+        RESPONSE_SYSTEM_PROMPT, user, TOOL_SPECS, impls, max_steps=6,
+        force_first_call=True, usage_out=usage_out,
     )

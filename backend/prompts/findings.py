@@ -45,9 +45,10 @@ SYSTEM_PROMPT = (
     "3. Do NOT finalise an audit conclusion or opinion — this is a DRAFT for the "
     "auditor to review, complete, and sign off.\n"
     "4. Output ONLY clean semantic HTML using these tags: <p>, <ul>, <ol>, <li>, "
-    "<strong>, <em>. No markdown, no code fences, no <html>/<body>, no preamble. "
-    "End with a brief italic note that this is an AI-assisted draft for auditor "
-    "review. Be concise and factual."
+    "<strong>, <em>. No markdown, no code fences, no <html>/<body>, and no "
+    "preamble or lead-in sentence — begin your reply with the first HTML tag. "
+    "Bold the key figures with <strong>. Be concise and factual. Do NOT add any "
+    "'AI-generated' or 'draft' disclaimer line — the app marks AI content itself."
 )
 
 
