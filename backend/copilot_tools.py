@@ -52,6 +52,13 @@ logger = logging.getLogger(__name__)
 _data_cache = TTLCache(COPILOT_DATA_CACHE_TTL_SEC)
 
 
+def clear_file_cache(audit_file_id: int) -> int:
+    """Invalidate every cached fetch for ONE audit file (all endpoints/params).
+    Called when 1audit reports the file changed, so the next question re-fetches
+    fresh data instead of serving the (now longer-lived) cache. Returns count."""
+    return _data_cache.clear_prefix(f"{int(audit_file_id)}:")
+
+
 class CopilotGrantError(Exception):
     """Raised when 1audit rejects the copilot grant (expired / wrong file). The
     chat router maps this to a 401 so the UI can re-mint a grant."""
@@ -790,9 +797,11 @@ WRITE_SYSTEM_PROMPT = (
     "field of a working paper. You are bound to ONE audit file and read its real "
     "data through the tools. Accuracy is critical (ISA 220): never invent a "
     "figure, name, date or conclusion, and NEVER emit a bracketed placeholder "
-    "like '[Client Name]' or '[amount]'. If a value cannot be fetched from the "
-    "file, write a short plain sentence saying so (and, if useful, where it is "
-    "set) instead of a placeholder.\n\n"
+    "like '[Client Name]' or '[amount]'. Only if a value genuinely cannot be "
+    "fetched (you CALLED the right tool and it returned no value) write a short "
+    "plain sentence saying so (and, if useful, where it is set) instead of a "
+    "placeholder — never claim a value is unavailable without having called its "
+    "tool first.\n\n"
     "WORK OUT WHAT THE FIELD NEEDS:\n"
     "1. If a <procedure> is provided, this field is the auditor's note / findings "
     "/ response FOR that procedure. Draft it grounded in the file's real data: "
@@ -809,12 +818,18 @@ WRITE_SYSTEM_PROMPT = (
     "   The field_label tells you the emphasis — a 'note'/'findings' field leads "
     "with the observations/what was found; a 'response' field leads with the "
     "direct answer.\n"
-    "2. If there is NO procedure, this is a free-form field. Fetch a file fact "
-    "ONLY when the instruction needs one (the client/entity name, sector, "
-    "currency, a date, a balance, a risk, a working paper's content — use "
-    "get_audit_file_summary for the profile/dates/client). Otherwise (pure "
-    "text-craft — rewrite, expand, shorten, fix tone or grammar) just write, with "
-    "no tool call, preserving the existing meaning and facts.\n\n"
+    "2. If there is NO procedure, this is a free-form field. If the field or "
+    "instruction asks for a specific FILE VALUE, you MUST call the matching tool "
+    "to fetch it before writing — pick the right one: get_materiality (overall / "
+    "performance / TRIVIAL materiality, cy & py), get_audit_file_summary (client, "
+    "sector, currency, dates, due date, file administrator), get_trial_balance / "
+    "get_financial_statement / get_audit_area (balances & account figures), "
+    "get_risks, get_review_points, get_analytical_review, get_engagement_team, "
+    "get_sampling_design (samples / sample size), list_documents, or "
+    "list_working_papers + get_working_paper for qualitative content. Only when "
+    "the field is pure text-craft (rewrite, expand, shorten, fix tone or grammar, "
+    "with no data value needed) write directly with no tool call, preserving the "
+    "existing meaning and facts.\n\n"
     "ALWAYS follow the auditor's <auditor_instruction> when present (focus, depth, "
     "emphasis, format, or a specific ask like 'add the client name') — but it must "
     "never make you invent or assume data; every file-specific value still comes "

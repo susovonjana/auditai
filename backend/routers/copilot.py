@@ -29,6 +29,7 @@ from embeddings import embed_query
 from rate_limit import limiter
 from routers.user import _load_session, _persist_ask_history
 import copilot_tools
+import file_cache_state
 import file_index
 import proc_memory
 import qa
@@ -552,6 +553,11 @@ async def chat_about_file(
             status_code=401,
             detail="Could not authorize AI access to this file's data (the grant may have expired). Please retry.",
         )
+
+    # Edit-triggered freshness: if 1audit reported this file changed since this
+    # worker last synced it, clear its cached fetches so the answer uses fresh
+    # data. Cheap local DB read; never blocks (failures leave the TTL backstop).
+    await file_cache_state.refresh_if_changed(payload.audit_file_id)
 
     # Bridge async KB retrieval into the (threaded) tool loop: when the model calls
     # search_standards, schedule _kb_retrieve back onto this running loop and block.

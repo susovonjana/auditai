@@ -417,3 +417,22 @@ class AuditFileIndex(Base):
     indexed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Table 12: audit_file_cache_state  — per-file "data changed" marker for the
+# copilot's live-data cache invalidation
+# ---------------------------------------------------------------------------
+class AuditFileCacheState(Base):
+    """One row per audit file recording WHEN its data last changed in 1audit.
+    1audit-be pings auditai on any edit → ``changed_at`` is bumped; each file-chat
+    request compares it to what this worker last applied and clears that file's
+    in-memory data cache when it's newer. Shared source of truth so the
+    invalidation is correct across multiple auditai workers. Purely additive
+    (auditai Postgres only)."""
+    __tablename__ = "audit_file_cache_state"
+
+    audit_file_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

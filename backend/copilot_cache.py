@@ -60,6 +60,16 @@ class TTLCache:
         with self._lock:
             self._store.clear()
 
+    def clear_prefix(self, prefix: str) -> int:
+        """Drop every entry whose key starts with ``prefix``. Used to invalidate
+        all of ONE audit file's cached fetches (keys are ``<id>:<endpoint>:<args>``)
+        when 1audit reports that file changed. Returns the number removed."""
+        with self._lock:
+            doomed = [k for k in self._store if k.startswith(prefix)]
+            for k in doomed:
+                del self._store[k]
+            return len(doomed)
+
     def size(self) -> int:
         with self._lock:
             return len(self._store)

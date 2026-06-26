@@ -88,12 +88,22 @@ ONEAUDIT_HTTP_CONNECT_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_CONNECT_TIMEOU
 # remains the hard enforcer on every tool call).
 COPILOT_GRANT_SECRET: str = os.getenv("COPILOT_GRANT_SECRET", "") or ""
 
+# Shared secret protecting auditai's INTERNAL endpoints (e.g. the "file changed"
+# cache-invalidation ping from 1audit-be). 1audit-be must send the SAME value in
+# the X-Internal-Secret header (its AUDITAI_INTERNAL_SECRET). When unset, the
+# internal endpoints are disabled (fail closed).
+INTERNAL_SHARED_SECRET: str = os.getenv("INTERNAL_SHARED_SECRET", "") or ""
+
 # Short-TTL cache for the file-mode chat's data fetches. Within this window a
 # repeated tool call (same file + endpoint + args) is served from memory instead
 # of re-querying 1audit-be, so a burst of questions doesn't re-fetch the same
 # trial balance / summary each time. The grant is still re-validated once per
 # chat request, so caching never bypasses authorization. Set to 0 to disable.
-COPILOT_DATA_CACHE_TTL_SEC: int = int(os.getenv("COPILOT_DATA_CACHE_TTL_SEC", "120"))
+# File-data cache lifetime. Now a SAFETY BACKSTOP: real freshness comes from the
+# per-file "changed" flag (1audit-be pings auditai on any edit → that file's cache
+# is cleared on the next question). So idle files can cache long without going
+# stale, and edits show immediately. This TTL only catches a missed/dropped ping.
+COPILOT_DATA_CACHE_TTL_SEC: int = int(os.getenv("COPILOT_DATA_CACHE_TTL_SEC", "1800"))
 
 # Output-token cap for the in-file chat tool loop. File-data answers are short
 # (## Answer + ≤3 follow-ups), so a tight cap lowers worst-case generation time
