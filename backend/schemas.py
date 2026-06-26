@@ -194,6 +194,9 @@ class ProcedureRequest(BaseModel):
     audit_file_id: Optional[int] = None
     copilot_grant: Optional[str] = None
     language: str = Field("en", pattern="^(en|ar)$")
+    # Optional persona / "role" lens (auditor | reviewer | …). Blank/absent ⇒ the
+    # elevated senior-auditor default. Resolved in prompts.personas (unknown ⇒ base).
+    role: Optional[str] = Field(None, max_length=64)
     # Optional caller identity (1audit embed). Accepts int or str.
     user_id: Optional[str] = None
     organization_id: Optional[str] = None
@@ -235,6 +238,9 @@ class WriteAssistRequest(BaseModel):
     audit_file_id: Optional[int] = None
     copilot_grant: Optional[str] = None
     language: str = Field("en", pattern="^(en|ar)$")
+    # Optional persona / "role" lens (auditor | reviewer | …). Blank/absent ⇒ the
+    # elevated senior-auditor default. Resolved in prompts.personas (unknown ⇒ base).
+    role: Optional[str] = Field(None, max_length=64)
     user_id: Optional[str] = None
     organization_id: Optional[str] = None
 

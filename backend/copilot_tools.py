@@ -19,18 +19,30 @@ Used by:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional
 
+import jwt
 import requests
 from pydantic import BaseModel
 
 from config import (
+    COPILOT_CHAT_MAX_TOKENS,
     COPILOT_DATA_CACHE_TTL_SEC,
+    COPILOT_GRANT_SECRET,
     ONEAUDIT_BASE_URL,
+    ONEAUDIT_HTTP_CONNECT_TIMEOUT,
     ONEAUDIT_HTTP_TIMEOUT,
 )
 from copilot_cache import TTLCache
-from structured import ToolSpec, ToolLoopResult, generate_structured, run_tool_loop
+from prompts import personas
+from structured import (
+    ToolSpec,
+    ToolLoopResult,
+    astream_tool_loop,
+    generate_structured,
+    run_tool_loop,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +77,11 @@ class CopilotContext:
         # never sweeps this file's data to answer "what is a branch?". Injected by
         # the router because retrieval is async and the tool loop is synchronous.
         self.kb_search = kb_search
+        # Optional bridge to the per-file semantic index (phase-2 RAG). When set,
+        # the model gets a search_file tool to find qualitative working-paper
+        # narrative ("which WP discusses going concern?"). Injected by the chat
+        # router (retrieval is async; the tool loop is synchronous).
+        self.file_search: Optional[Callable[[str], Any]] = None
         # Serve repeated identical fetches from the short-TTL cache. Enabled only
         # for the chat path (repeated questions), and only AFTER validate_grant()
         # has confirmed this request's grant — so a cache hit never bypasses auth.
@@ -79,15 +96,28 @@ class CopilotContext:
         None on a network error; payload is the `data` body or an {"error": …}
         dict the LLM (or caller) can reason about."""
         url = f"{self.base_url}/copilot/audit_files/{self.audit_file_id}/{endpoint}"
-        try:
-            resp = requests.get(
-                url,
-                params={k: v for k, v in (params or {}).items() if v is not None},
-                headers={"X-Copilot-Grant": self.grant},
-                timeout=ONEAUDIT_HTTP_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            logger.warning("copilot tool HTTP error (%s): %s", endpoint, exc)
+        clean_params = {k: v for k, v in (params or {}).items() if v is not None}
+        headers = {"X-Copilot-Grant": self.grant}
+        # (connect, read) timeouts: connect is short so a down be is detected at
+        # once; read caps a stalled call so it can't freeze the whole answer.
+        timeout = (ONEAUDIT_HTTP_CONNECT_TIMEOUT, ONEAUDIT_HTTP_TIMEOUT)
+        last_exc = None
+        # Retry ONCE on a transient connection error only — NOT on a read timeout
+        # (retrying a genuine stall would just double the wait).
+        for attempt in range(2):
+            try:
+                resp = requests.get(url, params=clean_params, headers=headers, timeout=timeout)
+                break
+            except requests.ConnectionError as exc:
+                last_exc = exc
+                if attempt == 0:
+                    continue
+                logger.warning("copilot tool connection error (%s): %s", endpoint, exc)
+                return None, {"error": f"Could not reach 1audit for '{endpoint}'."}
+            except requests.RequestException as exc:
+                logger.warning("copilot tool HTTP error (%s): %s", endpoint, exc)
+                return None, {"error": f"Could not reach 1audit for '{endpoint}'."}
+        else:  # pragma: no cover - loop always breaks or returns
             return None, {"error": f"Could not reach 1audit for '{endpoint}'."}
         if resp.status_code != 200:
             return resp.status_code, {
@@ -128,6 +158,35 @@ class CopilotContext:
             raise CopilotGrantError(detail or "Copilot grant rejected for this file.")
         if status == 200 and self.use_cache:
             _data_cache.set(self._cache_key("summary", None), payload)
+
+    def validate_grant_local(self) -> None:
+        """Validate the grant WITHOUT a be round-trip — checks scope, expiry and
+        that it's for THIS file. If COPILOT_GRANT_SECRET is configured (matching
+        be's), the HS256 signature is verified too; otherwise we decode-only and
+        rely on be enforcing the grant on every tool call (the hard boundary).
+        Raises CopilotGrantError on any failure so the chat route returns 401."""
+        token = self.grant
+        if not token:
+            raise CopilotGrantError("Copilot grant is missing.")
+        try:
+            if COPILOT_GRANT_SECRET:
+                decoded = jwt.decode(token, COPILOT_GRANT_SECRET, algorithms=["HS256"])
+            else:
+                decoded = jwt.decode(token, options={"verify_signature": False})
+                exp = decoded.get("exp")
+                if exp is not None and float(exp) < time.time():
+                    raise CopilotGrantError("Copilot grant has expired.")
+        except jwt.ExpiredSignatureError:
+            raise CopilotGrantError("Copilot grant has expired.")
+        except jwt.PyJWTError as exc:
+            raise CopilotGrantError(f"Invalid copilot grant: {exc}")
+        if decoded.get("scope") != "copilot":
+            raise CopilotGrantError("Invalid copilot grant scope.")
+        try:
+            if int(decoded.get("audit_file_id")) != self.audit_file_id:
+                raise CopilotGrantError("Copilot grant is for a different audit file.")
+        except (TypeError, ValueError):
+            raise CopilotGrantError("Copilot grant is missing a valid audit_file_id.")
 
 
 def _safe_json(resp) -> Any:
@@ -172,6 +231,24 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
     ) -> Any:
         return ctx.get("audit_area", {"area": area, "coa_original_id": coa_original_id})
 
+    def get_materiality() -> Any:
+        return ctx.get("materiality")
+
+    def get_review_points() -> Any:
+        return ctx.get("review_points")
+
+    def get_analytical_review() -> Any:
+        return ctx.get("analytical_review")
+
+    def get_engagement_team() -> Any:
+        return ctx.get("engagement_team")
+
+    def get_sampling_design(account: Optional[str] = None) -> Any:
+        return ctx.get("sampling", {"account": account})
+
+    def list_documents() -> Any:
+        return ctx.get("documents")
+
     def search_standards(query: str = "", **_) -> Any:
         # NOT a file tool — searches the shared knowledge base (auditing
         # standards + 1audit product help). Returns relevant passages so the
@@ -180,6 +257,15 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
         if not ctx.kb_search:
             return {"error": "standards search is unavailable here"}
         return {"results": ctx.kb_search(query or "")}
+
+    def search_file(query: str = "", **_) -> Any:
+        # Semantic search over THIS file's working-paper NARRATIVE (procedure
+        # questions, the auditor's notes/answers, titles, comments). Use to FIND
+        # qualitative content across working papers; then get_working_paper for
+        # full detail. Returns passages, each with its working-paper source.
+        if not ctx.file_search:
+            return {"error": "file search is unavailable here"}
+        return {"results": ctx.file_search(query or "")}
 
     return {
         "get_audit_file_summary": get_audit_file_summary,
@@ -190,7 +276,14 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
         "get_financial_statement": get_financial_statement,
         "get_working_paper": get_working_paper,
         "get_audit_area": get_audit_area,
+        "get_materiality": get_materiality,
+        "get_review_points": get_review_points,
+        "get_analytical_review": get_analytical_review,
+        "get_engagement_team": get_engagement_team,
+        "get_sampling_design": get_sampling_design,
+        "list_documents": list_documents,
         "search_standards": search_standards,
+        "search_file": search_file,
     }
 
 
@@ -203,9 +296,11 @@ TOOL_SPECS: List[ToolSpec] = [
             "THIS audit file's profile and key dates: file name, client, sector, "
             "reporting currency, status, the audit period and its start/end dates "
             "(plus the prior-year period), field-work start date, engagement date "
-            "and the DUE DATE. Use this for ANY question about this file's "
-            "metadata, deadlines or dates (e.g. 'period end date of this file', "
-            "'what is the due date of this file')."
+            "and the DUE DATE. ALSO returns the file ADMINISTRATOR / file manager "
+            "(name + role) and who CREATED the file. Use this for ANY question "
+            "about this file's metadata, deadlines or dates (e.g. 'period end date "
+            "of this file', 'what is the due date of this file'), or about who "
+            "administers / manages / created / owns this file."
         ),
         parameters={"type": "object", "properties": {}},
     ),
@@ -320,6 +415,76 @@ TOOL_SPECS: List[ToolSpec] = [
             },
         },
     ),
+    ToolSpec(
+        name="get_materiality",
+        description=(
+            "THIS file's materiality: overall (initial & final), performance "
+            "materiality and trivial-misstatement threshold — each with current-"
+            "year & prior-year amounts and the relevant percentages — plus the "
+            "benchmark bases used. Use for ANY materiality question about this "
+            "file (e.g. 'what is the materiality of this file', 'performance "
+            "materiality', 'trivial threshold')."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_review_points",
+        description=(
+            "THIS file's review points / completion sign-off: each point's text, "
+            "whether it's reviewed and resolved (and by whom/when), and the "
+            "working paper it sits on. Use for review status / completion / "
+            "outstanding-points questions."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_analytical_review",
+        description=(
+            "THIS file's analytical review: line items flagged with a significant "
+            "variance and the auditor's comments, across the balance sheet and "
+            "income statement. Use for analytical-review / variance-explanation "
+            "questions."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_engagement_team",
+        description=(
+            "THIS file's engagement team: member names, their roles, and whether "
+            "they accepted the independence declaration. Use for 'who is on the "
+            "team / engagement partner / independence' questions."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_sampling_design",
+        description=(
+            "THIS file's samples: each sample's ACCOUNT (name + code), population "
+            "amount, planned vs tested item counts (the sample size = no_of_items), "
+            "the materiality parameters used, and any misstatement found / "
+            "projected. Use for sampling design / sample-size questions. For a "
+            "specific account (e.g. 'sample size of the Land account') pass that "
+            "account name/code as `account` to narrow the samples."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string",
+                    "description": "optional account name/code to narrow samples to one account",
+                }
+            },
+        },
+    ),
+    ToolSpec(
+        name="list_documents",
+        description=(
+            "THIS file's documents / supporting evidence (metadata only — name, "
+            "reference, type, and linked working papers; not the file contents). "
+            "Use for 'what documents are attached / supporting evidence' questions."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
 ]
 
 
@@ -349,22 +514,75 @@ STANDARDS_TOOL_SPEC = ToolSpec(
 )
 
 
+# Per-file semantic search — added to the file-mode loop ONLY when a file_search
+# bridge is supplied (the chat path). It searches THIS file's working-paper
+# narrative; it does NOT replace the structured tools (TB, materiality, samples…).
+FILE_SEARCH_TOOL_SPEC = ToolSpec(
+    name="search_file",
+    description=(
+        "Semantic search over THIS audit file's working-paper NARRATIVE — the "
+        "qualitative text the auditor wrote: procedure questions, notes, free-text "
+        "answers/conclusions, section titles and comments, across ALL working "
+        "papers at once. Use this to FIND where something is discussed or what was "
+        "concluded when you don't know which working paper holds it — e.g. 'what "
+        "did we conclude on going concern?', 'where are related parties addressed?', "
+        "'revenue recognition approach', 'management override response'. Returns "
+        "passages, each tagged with its working paper, so you can then call "
+        "get_working_paper for the full detail. For STRUCTURED data (figures, "
+        "balances, materiality, samples, dates) use the dedicated tools instead — "
+        "they are exact and always current."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "what to find in this file's working-paper narrative",
+            }
+        },
+        "required": ["query"],
+    },
+)
+
+
 SYSTEM_FILE_ANSWER = (
     "You are the 1audit assistant. You answer two kinds of questions: (a) about "
     "THIS specific audit file's own data, and (b) general auditing / standards / "
     "1audit product-help questions.\n\n"
     "DECIDE THE SOURCE BEFORE CALLING ANY TOOL:\n"
     "1. ABOUT THIS FILE — its figures, balances, accounts, trial balance, "
-    "financial statements, working papers, risks, sampling or audit areas, OR its "
-    "profile / metadata (client, sector, currency, status, the audit period and "
+    "financial statements, working papers, risks, materiality, review points, "
+    "analytical review, engagement team, samples, documents, sampling or audit areas, OR its "
+    "profile / metadata (client, sector, currency, status, the file administrator "
+    "/ manager or who created it, the audit period and "
     "ANY date such as the period start/end, field-work start, engagement date or "
     "DUE DATE) — use the FILE tools: get_audit_file_summary (for the file's "
-    "profile, dates and due date), get_trial_balance, get_financial_statement, "
+    "profile, dates, due date, AND the file administrator / who created it), "
+    "get_trial_balance, get_financial_statement, "
     "list_working_papers + get_working_paper, get_risks, get_audit_area, "
-    "get_procedure_results. Any question phrased as '… of this file' or \"this "
+    "get_procedure_results, get_materiality (overall / performance / trivial "
+    "materiality, cy & py), get_review_points (review / completion sign-off), "
+    "get_analytical_review (variances + comments), get_engagement_team (members / "
+    "roles / independence), get_sampling_design (samples per ACCOUNT + parameters; "
+    "pass an `account` to narrow to one account's sample size), or "
+    "list_documents (attached evidence). Any question phrased as '… of this file' "
+    "or \"this "
     "file's …\" is about THIS file — answer it from these tools, never from "
-    "search_standards. (If unsure which working paper holds something, call "
-    "list_working_papers first.)\n"
+    "search_standards. To FIND qualitative working-paper content — what was "
+    "concluded or discussed and WHERE (e.g. going concern, related parties, "
+    "revenue recognition, management override) — use search_file (semantic search "
+    "over all working papers' narrative), then get_working_paper for the full "
+    "detail; if unsure which working paper holds something, search_file or "
+    "list_working_papers first. (search_file is for qualitative text only — for "
+    "figures/balances/materiality/samples/dates use the structured tools above.)\n"
+    "BE EFFICIENT WITH TOOLS — latency matters: call ONLY the tools needed to "
+    "answer (don't gather extra context 'just in case'); for a specific value "
+    "(materiality, a date, the client, an account balance) call that ONE tool "
+    "directly. When you need several INDEPENDENT pieces of data, request them "
+    "TOGETHER in a single step (parallel tool calls), not one after another. After "
+    "search_file, go straight to get_working_paper for the working paper it "
+    "surfaced — do NOT also call list_working_papers (search_file already names "
+    "the source).\n"
     "2. GENERAL — a definition or concept (e.g. 'what is a branch?'), what a "
     "standard requires (e.g. 'what does ISA 315 say?'), or how to use 1audit "
     "(e.g. 'how do I add a working paper?') — call search_standards. NEVER call "
@@ -417,6 +635,10 @@ SYSTEM_FILE_ANSWER = (
     "'##' headers always stay in English."
 )
 
+# Elevated default: the senior-auditor lens prepended to the file-chat prompt.
+# Format/scope/grounding rules above stay authoritative (the lens defers to them).
+_SYSTEM_FILE_ANSWER_SENIOR = personas.with_base(SYSTEM_FILE_ANSWER)
+
 
 def answer_about_file(
     question: str,
@@ -441,16 +663,50 @@ def answer_about_file(
     )
     ctx.validate_grant()
     impls = build_tool_impls(ctx)
-    specs = TOOL_SPECS + [STANDARDS_TOOL_SPEC] if kb_search else TOOL_SPECS
+    specs = list(TOOL_SPECS)
+    if kb_search:
+        specs.append(STANDARDS_TOOL_SPEC)
+    if ctx.file_search:
+        specs.append(FILE_SEARCH_TOOL_SPEC)
     lang_name = "Arabic" if language == "ar" else "English"
     user = f"Question: {question}\n\nAnswer in {lang_name}."
     # force_first_call: a question only reaches this loop when it needs THIS
     # file's data, so make the model fetch with a tool before it may answer —
     # never let it guess a figure/date or just say it will look it up.
     return run_tool_loop(
-        SYSTEM_FILE_ANSWER, user, specs, impls, max_steps=6,
+        _SYSTEM_FILE_ANSWER_SENIOR, user, specs, impls, max_steps=6,
         force_first_call=True, usage_out=usage_out,
     )
+
+
+async def astream_about_file(
+    question: str,
+    ctx: CopilotContext,
+    language: str = "en",
+    usage_out: Optional[dict] = None,
+    tools_used_out: Optional[list] = None,
+):
+    """Streaming sibling of ``answer_about_file``: yields the grounded answer's
+    text deltas as they generate (the final tool-loop turn streams token by
+    token). Expects a PRE-VALIDATED ``ctx`` — the chat route validates the grant
+    and warms the file summary up front, so this does not re-validate. If
+    ``ctx.kb_search`` is set the model also gets search_standards for general
+    questions. Output is capped at COPILOT_CHAT_MAX_TOKENS (file answers are
+    short). Fills ``usage_out`` / ``tools_used_out`` once the stream completes."""
+    impls = build_tool_impls(ctx)
+    specs = list(TOOL_SPECS)
+    if ctx.kb_search:
+        specs.append(STANDARDS_TOOL_SPEC)
+    if ctx.file_search:
+        specs.append(FILE_SEARCH_TOOL_SPEC)
+    lang_name = "Arabic" if language == "ar" else "English"
+    user = f"Question: {question}\n\nAnswer in {lang_name}."
+    async for piece in astream_tool_loop(
+        _SYSTEM_FILE_ANSWER_SENIOR, user, specs, impls, 6,
+        force_first_call=True, max_output_tokens=COPILOT_CHAT_MAX_TOKENS,
+        usage_out=usage_out, tools_used_out=tools_used_out,
+    ):
+        yield piece
 
 
 # ---------------------------------------------------------------------------
@@ -471,12 +727,17 @@ _INTENT_SYSTEM = (
     "Set needs_file_data=TRUE when the question asks for anything that belongs to "
     "THIS file, including:\n"
     "- its FIGURES: account balances, trial balance, financial-statement amounts, "
-    "a working paper's recorded answers, assessed risks, sampling/exception "
+    "materiality (overall / performance / trivial), review points / sign-off "
+    "status, analytical-review variances, the engagement team, samples, attached "
+    "documents, a working paper's recorded answers, assessed risks, sampling/exception "
     "results; and\n"
     "- its METADATA / PROFILE: the client or entity name, sector, reporting "
     "currency, the audit period, ANY date (period start/end, prior-year period, "
     "field-work start, engagement date, DUE DATE / deadline), the file's status "
-    "or progress, or whether it is consolidated.\n"
+    "or progress, whether it is consolidated, or WHO administers / manages / "
+    "created / owns this file (the file administrator).\n"
+    "- about a NAMED ACCOUNT in this file: its balance, samples or the SAMPLE SIZE "
+    "of an account (e.g. 'sample size of the Land account'), exceptions, or risk.\n"
     "A strong signal is wording that points at the current file — 'this file', "
     "'this audit', 'this engagement', 'of this file', \"the file's …\" — or asking "
     "for the VALUE of a property (what IS the period end date / due date / client "
@@ -578,6 +839,7 @@ def write_with_file(
     base_url: Optional[str] = None,
     usage_out: Optional[dict] = None,
     procedure: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> ToolLoopResult:
     """The one grounded writer for every non-procedure field inside an audit file
     (note/findings, response, comment, …), via the tool-calling loop. When a
@@ -631,6 +893,6 @@ def write_with_file(
     # note/response case must be grounded in real results, like respond did). A
     # free-form field decides for itself whether it needs the tools.
     return run_tool_loop(
-        WRITE_SYSTEM_PROMPT, user, TOOL_SPECS, impls, max_steps=6,
+        personas.with_role(WRITE_SYSTEM_PROMPT, role), user, TOOL_SPECS, impls, max_steps=6,
         force_first_call=bool(proc), usage_out=usage_out,
     )

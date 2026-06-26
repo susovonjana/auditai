@@ -40,7 +40,7 @@ _MAX_QUESTION_CHARS = 300
 # Gemini Flash typically responds in 0.5-2 s on a host near a Google region;
 # from a laptop / overseas Docker the round-trip can hit 3-5 s. 5 s is the
 # default — bump via env if your deployment sees higher tail latency.
-_EXPANSION_TIMEOUT_SEC = float(os.getenv("QUERY_EXPANSION_TIMEOUT_SEC", "5.0"))
+_EXPANSION_TIMEOUT_SEC = float(os.getenv("QUERY_EXPANSION_TIMEOUT_SEC", "2.5"))
 
 # LRU cache (bounded) for expansions. 256 entries × ~4 small strings each
 # is negligible memory, and saves a Gemini call per repeated/paraphrased ask.

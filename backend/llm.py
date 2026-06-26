@@ -459,6 +459,160 @@ def run_tool_loop(
 
 
 # ---------------------------------------------------------------------------
+# (3b) Streaming tool-calling loop — streams the FINAL answer token-by-token
+# ---------------------------------------------------------------------------
+def stream_tool_loop(
+    system: str,
+    user: str,
+    tools: List[ToolSpec],
+    tool_impls: Dict[str, Callable[..., Any]],
+    max_steps: int = 6,
+    *,
+    tier: str = "smart",
+    temperature: float = 0.0,
+    max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    force_first_call: bool = False,
+    usage_out: Optional[dict] = None,
+    tools_used_out: Optional[List[ToolCall]] = None,
+):
+    """Like ``run_tool_loop`` but STREAMS the final text answer as it generates.
+
+    Each turn is opened with ``client.messages.stream(...)``: text deltas are
+    yielded as they arrive (so the final answer renders progressively), and once
+    the turn finishes ``get_final_message()`` is read to drive the loop — on
+    ``stop_reason == "tool_use"`` the matching impls run and the loop continues;
+    otherwise the answer is complete. Tool-gathering turns emit little/no text
+    (with ``force_first_call`` turn 0 is a forced tool call), so in practice only
+    the final answer streams. Per-turn model failover happens only before that
+    turn's first streamed token (same trade-off as ``stream_text``). ``usage_out``
+    and ``tools_used_out`` are filled for the caller to meter spend / list sources.
+    """
+    client = _client()
+    order = _model_order(tier)
+    anthropic_tools = [
+        {
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.parameters or {"type": "object", "properties": {}},
+        }
+        for t in tools
+    ]
+    if anthropic_tools:
+        anthropic_tools[-1] = {
+            **anthropic_tools[-1], "cache_control": {"type": "ephemeral"}
+        }
+    messages: list = [{"role": "user", "content": user}]
+    tools_used: List[ToolCall] = (
+        tools_used_out if tools_used_out is not None else []
+    )
+    total_in = total_out = 0
+    used_model = ""
+
+    for step in range(max_steps):
+        kwargs = _base_kwargs(
+            system=system or None,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if anthropic_tools:
+            kwargs["tools"] = anthropic_tools
+        if force_first_call and step == 0 and anthropic_tools:
+            kwargs["tool_choice"] = {"type": "any"}
+
+        # One streaming turn, with model failover before its first token only.
+        final_msg = None
+        last_exc: Optional[Exception] = None
+        for model in order:
+            mgr = None
+            committed = False
+            try:
+                mgr = client.messages.stream(model=model, **kwargs)
+                stream = mgr.__enter__()
+                for piece in stream.text_stream:
+                    if piece:
+                        committed = True
+                        yield piece
+                final_msg = stream.get_final_message()
+                used_model = model
+                mgr.__exit__(None, None, None)
+                mgr = None
+                break
+            except Exception as exc:
+                if mgr is not None:
+                    try:
+                        mgr.__exit__(type(exc), exc, None)
+                    except Exception:
+                        pass
+                if (not committed) and is_throttle_error(exc):
+                    _mark_cooldown(model)
+                    last_exc = exc
+                    continue
+                raise
+        else:
+            # Every model throttled before producing any output this turn.
+            if last_exc is not None:
+                raise last_exc
+            break
+
+        if final_msg is None:
+            break
+        u = _usage_from(final_msg, used_model)
+        total_in += u.input_tokens
+        total_out += u.output_tokens
+
+        if getattr(final_msg, "stop_reason", None) == "tool_use":
+            # Echo the assistant turn back as plain param dicts. The streamed
+            # get_final_message() tool_use blocks carry a `caller: null` field that
+            # Bedrock rejects on the next request ("tool_use.caller: Input should
+            # be a valid dictionary"), so rebuild clean text / tool_use blocks.
+            assistant_content: list = []
+            results = []
+            for block in final_msg.content:
+                bt = getattr(block, "type", None)
+                if bt == "text":
+                    assistant_content.append({"type": "text", "text": block.text})
+                    continue
+                if bt != "tool_use":
+                    continue
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input or {},
+                })
+                name = block.name
+                args = dict(block.input or {})
+                tools_used.append(ToolCall(name=name, args=args))
+                impl = tool_impls.get(name)
+                if impl is None:
+                    result: Any = {"error": f"Unknown tool '{name}'"}
+                else:
+                    try:
+                        result = impl(**args)
+                    except Exception as exc:  # surface tool failure to the model
+                        logger.exception("stream_tool_loop: tool %s raised", name)
+                        result = {"error": str(exc)}
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(_sanitize_tool_result(result), default=str),
+                })
+            messages.append({"role": "assistant", "content": assistant_content})
+            messages.append({"role": "user", "content": results})
+            continue
+
+        # Final text turn — already streamed above.
+        if usage_out is not None:
+            usage_out.update(input=total_in, output=total_out, model=used_model)
+        return
+
+    logger.warning("stream_tool_loop hit max_steps=%d", max_steps)
+    if usage_out is not None:
+        usage_out.update(input=total_in, output=total_out, model=used_model)
+
+
+# ---------------------------------------------------------------------------
 # (4) Streaming free-text generation
 # ---------------------------------------------------------------------------
 def stream_text(

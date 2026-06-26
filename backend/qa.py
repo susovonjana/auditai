@@ -39,6 +39,7 @@ from models import DocumentChunk, Document, SearchHistory
 from query_expander import expand_query
 from query_preprocessor import correct_typos
 from reranker import rerank
+from prompts import personas
 import smalltalk
 
 logger = logging.getLogger(__name__)
@@ -308,6 +309,12 @@ Hard rules:
 - If a previous Q&A in the conversation provides context for a follow-up ("what about...", "and the threshold?"), treat it as continuation of the same topic.
 - Output must be valid Markdown. Be concise — aim for the shortest answer that is complete and accurate.
 """
+
+
+# Elevated default: the senior-auditor lens prepended once. The two-section
+# structure, formatting rules, scope/answer-gating and grounding above stay
+# authoritative (the lens defers to them); precomputed so it's a stable cached prefix.
+_SYSTEM_PROMPT_SENIOR = personas.with_base(SYSTEM_PROMPT)
 
 
 # ---------------------------------------------------------------------------
@@ -696,7 +703,7 @@ def _call_llm_sync(prompt: str) -> tuple[str, dict]:
     model selection / failover lives in llm.py. Usage keys are
     prompt/completion/total to match the SearchHistory columns."""
     result = llm.complete_text(
-        SYSTEM_PROMPT,
+        _SYSTEM_PROMPT_SENIOR,
         prompt,
         tier="smart",
         temperature=0.2,
@@ -935,7 +942,7 @@ def _stream_llm_sync(prompt: str, usage_out: Optional[dict] = None):
     prompt/completion/total to match the SearchHistory columns."""
     inner: dict = {}
     for piece in llm.stream_text(
-        SYSTEM_PROMPT,
+        _SYSTEM_PROMPT_SENIOR,
         prompt,
         tier="smart",
         temperature=0.2,

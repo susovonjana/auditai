@@ -42,6 +42,7 @@ __all__ = [
     "run_tool_loop",
     "stream_text",
     "astream_text",
+    "astream_tool_loop",
 ]
 
 logger = logging.getLogger(__name__)
@@ -165,6 +166,62 @@ async def astream_text(
                 max_output_tokens=max_output_tokens,
                 tier=tier,
                 usage_out=usage_out,
+            ):
+                asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
+        except Exception as exc:  # forward to consumer
+            asyncio.run_coroutine_threadsafe(queue.put(_StreamError(exc)), loop)
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # sentinel
+
+    asyncio.create_task(asyncio.to_thread(producer))
+
+    while True:
+        piece = await queue.get()
+        if piece is None:
+            break
+        if isinstance(piece, _StreamError):
+            raise piece.exc
+        yield piece
+
+
+# ---------------------------------------------------------------------------
+# (4) Streaming tool-calling loop (async wrapper)
+# ---------------------------------------------------------------------------
+async def astream_tool_loop(
+    system: str,
+    user: str,
+    tools: List[ToolSpec],
+    tool_impls: Dict[str, Callable[..., Any]],
+    max_steps: int = 6,
+    *,
+    temperature: float = 0.0,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    force_first_call: bool = False,
+    tier: str = "smart",
+    usage_out: Optional[dict] = None,
+    tools_used_out: Optional[list] = None,
+) -> AsyncIterator[str]:
+    """Async wrapper around ``llm.stream_tool_loop``: runs the blocking generator
+    in a worker thread and yields the final-answer text chunks as they arrive.
+    ``usage_out`` / ``tools_used_out`` are filled once the loop completes. Any
+    producer exception is re-raised in the consuming coroutine."""
+    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def producer():
+        try:
+            for piece in llm.stream_tool_loop(
+                system,
+                user,
+                tools,
+                tool_impls,
+                max_steps,
+                tier=tier,
+                temperature=temperature,
+                max_tokens=max_output_tokens,
+                force_first_call=force_first_call,
+                usage_out=usage_out,
+                tools_used_out=tools_used_out,
             ):
                 asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
         except Exception as exc:  # forward to consumer

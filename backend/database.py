@@ -143,3 +143,16 @@ async def init_db() -> None:
                 """
             )
         )
+
+        # audit_file_chunks (phase-2 per-file RAG) — cosine index for semantic
+        # search over ONE audit file's working-paper narrative.
+        await conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS audit_file_chunks_embedding_idx
+                ON audit_file_chunks
+                USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100)
+                """
+            )
+        )

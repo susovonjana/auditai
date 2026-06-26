@@ -74,7 +74,19 @@ ONEAUDIT_BASE_URL: str = os.getenv(
 )
 # Timeout (seconds) for copilot data callbacks to 1audit-be. Some read services
 # (e.g. a lead-sheet-heavy working paper's content) take ~20s, so allow headroom.
-ONEAUDIT_HTTP_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_TIMEOUT", "45"))
+# Read timeout for ONE internal be data call. Kept tight so a stalled be call
+# fails fast and the tool loop proceeds (or says it couldn't fetch) instead of
+# freezing the whole answer — a single hung call used to block ~45s. Connect
+# timeout is separate (short) so a down be is detected immediately.
+ONEAUDIT_HTTP_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_TIMEOUT", "15"))
+ONEAUDIT_HTTP_CONNECT_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_CONNECT_TIMEOUT", "5"))
+
+# Shared secret used by 1audit-be to SIGN copilot grants (HS256). When set here
+# (must MATCH be's COPILOT_GRANT_SECRET / JWT_LOGIN_SECRET), auditai verifies the
+# grant's signature locally — no per-question /summary round-trip to be. When
+# unset, auditai still checks the grant's expiry + scope + file locally (be
+# remains the hard enforcer on every tool call).
+COPILOT_GRANT_SECRET: str = os.getenv("COPILOT_GRANT_SECRET", "") or ""
 
 # Short-TTL cache for the file-mode chat's data fetches. Within this window a
 # repeated tool call (same file + endpoint + args) is served from memory instead
@@ -82,6 +94,21 @@ ONEAUDIT_HTTP_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_TIMEOUT", "45"))
 # trial balance / summary each time. The grant is still re-validated once per
 # chat request, so caching never bypasses authorization. Set to 0 to disable.
 COPILOT_DATA_CACHE_TTL_SEC: int = int(os.getenv("COPILOT_DATA_CACHE_TTL_SEC", "120"))
+
+# Output-token cap for the in-file chat tool loop. File-data answers are short
+# (## Answer + ≤3 follow-ups), so a tight cap lowers worst-case generation time
+# without truncating real answers — distinct from the 4096 default used elsewhere.
+COPILOT_CHAT_MAX_TOKENS: int = int(os.getenv("COPILOT_CHAT_MAX_TOKENS", "1500"))
+
+# Phase-2 per-file RAG (search_file). The index is rebuilt lazily when the file's
+# change-signature differs; this TTL is a BACKSTOP that forces a re-check even when
+# the signature is unchanged (catches edits that don't bump a working-paper row).
+COPILOT_FILE_INDEX_TTL_SEC: int = int(os.getenv("COPILOT_FILE_INDEX_TTL_SEC", "600"))
+# How many narrative chunks to retrieve before reranking, and how many to return.
+COPILOT_FILE_SEARCH_CANDIDATES: int = int(os.getenv("COPILOT_FILE_SEARCH_CANDIDATES", "30"))
+COPILOT_FILE_SEARCH_TOP_K: int = int(os.getenv("COPILOT_FILE_SEARCH_TOP_K", "6"))
+# Safety bound on how many chunks one file's index may hold.
+COPILOT_FILE_INDEX_MAX_CHUNKS: int = int(os.getenv("COPILOT_FILE_INDEX_MAX_CHUNKS", "600"))
 
 # TTL for caching the Tier-3 LLM mapping picks in tb_mapping_engine, so re-running
 # "AI auto map" over the same accounts (re-clicks, re-maps) doesn't re-spend the

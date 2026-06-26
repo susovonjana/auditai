@@ -364,3 +364,56 @@ class AiOrgQuota(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Table 10: audit_file_chunks  (phase-2 per-file RAG — semantic search over ONE
+# audit file's working-paper narrative)
+# ---------------------------------------------------------------------------
+class AuditFileChunk(Base):
+    """A chunk of a single audit file's working-paper NARRATIVE (procedure
+    questions, the auditor's notes/free-text answers, titles, comments), embedded
+    so the copilot's search_file tool can semantically find "which WP discusses
+    going concern / related parties / …" without sweeping every WP.
+
+    Scoped strictly to one audit_file_id. Built lazily and REPLACED wholesale on
+    reindex (the file's content changes as auditors work), so rows are transient
+    cache, never a source of truth — 1audit-be remains authoritative. Purely
+    additive: lives only in auditai's own Postgres."""
+    __tablename__ = "audit_file_chunks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    audit_file_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Any] = mapped_column(
+        Vector(EMBEDDING_DIMENSIONS), nullable=False
+    )
+    # Where this chunk came from in the file, e.g. "C1 - Checklist Final" — shown
+    # to the model so it can cite / drill into the working paper.
+    source_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    char_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Table 11: audit_file_index  (freshness bookkeeping for the per-file RAG index)
+# ---------------------------------------------------------------------------
+class AuditFileIndex(Base):
+    """One row per indexed audit file: the change-signature it was built from, a
+    content hash (to skip re-embedding when nothing material changed), the chunk
+    count and when it was built. Lets search_file decide cheaply whether to reuse
+    the existing chunks or rebuild. Purely additive (auditai Postgres only)."""
+    __tablename__ = "audit_file_index"
+
+    audit_file_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    signature: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    indexed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
