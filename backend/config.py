@@ -286,6 +286,26 @@ AI_CREDIT_TIER_RATES: dict[str, tuple[float, float]] = {
     "fast": (AI_CREDITS_FAST_IN_PER_1K, AI_CREDITS_FAST_OUT_PER_1K),
 }
 
+# --- Supervised AI agent runtime (file review, engagement build-out, ...) ---
+# Master on/off for the whole agent feature; the /agent/* routes return 403 when
+# false, so the runtime ships dark and is enabled per environment.
+AGENT_FEATURE_ENABLED: bool = os.getenv("AGENT_FEATURE_ENABLED", "false").lower() == "true"
+
+
+# Pilot allowlist: only these orgs may start agent runs (mirror the FE widget
+# gate, which today hard-codes orgs 11,32). Comma-separated; compared as STRINGS
+# because the grant/session organization_id is stringified. Empty => no org
+# allowed (so turning the master flag on alone does not expose it firm-wide).
+def _csv_set(raw: str) -> set[str]:
+    return {s.strip() for s in (raw or "").split(",") if s.strip()}
+
+
+AGENT_ALLOWED_ORG_IDS: set[str] = _csv_set(os.getenv("AGENT_ALLOWED_ORG_IDS", ""))
+# Guardrails — hard caps so a run can never loop unbounded or overspend.
+AGENT_STEP_LIMIT: int = int(os.getenv("AGENT_STEP_LIMIT", "12"))
+AGENT_RUN_TIMEOUT_SEC: int = int(os.getenv("AGENT_RUN_TIMEOUT_SEC", "120"))
+AGENT_MAX_RUN_CREDITS: int = int(os.getenv("AGENT_MAX_RUN_CREDITS", "4000"))
+
 # --- Security: file encryption at rest ---
 # 32 random URL-safe base64 chars. Generated with:
 #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"

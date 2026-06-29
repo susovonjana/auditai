@@ -25,6 +25,7 @@ from database import AsyncSessionLocal, engine, init_db
 from models import AdminUser
 from rate_limit import limiter
 from routers import admin as admin_router
+from routers import agent as agent_router
 from routers import copilot as copilot_router
 from routers import health as health_router
 from routers import internal as internal_router
@@ -171,6 +172,7 @@ app.include_router(admin_router.router)
 app.include_router(user_router.router)
 app.include_router(copilot_router.router)
 app.include_router(internal_router.router)
+app.include_router(agent_router.router)
 
 
 @app.get("/")

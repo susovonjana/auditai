@@ -733,3 +733,87 @@ async def tb_mapping_feedback(
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("tb-mapping feedback store failed: %s", exc)
     return {"stored": stored}
+
+
+# System fields the AI maps spreadsheet columns to (the import wizard's MappableFields).
+_TB_DETECT_FIELDS = {
+    "account_code": "the account / ledger code",
+    "account_name": "the account name or description (may be in any language, e.g. Arabic)",
+    "cy_amount": "current-year balance/amount (the year being audited)",
+    "py_amount": "prior-year balance/amount",
+    "py2_amount": "two-years-prior balance/amount",
+    "cy_movement": "current-year movement / transactions in the period",
+    "py_movement": "prior-year movement / transactions",
+    "planning_cy_amount": "current-year planning/budget amount",
+    "planning_py_amount": "prior-year planning/budget amount",
+    "planning_py2_amount": "two-years-prior planning/budget amount",
+    "mapping_data": "a chart-of-accounts code used for auto-mapping",
+}
+
+
+def _build_detect_result(matches, headers) -> dict:
+    """Keep only valid (field, column) matches, dedup per field, round confidence.
+    Accepts pydantic TbColumnMatch objects or plain dicts. Deterministic — unit-tested."""
+    valid_cols = {h.get("column") for h in headers if h.get("column")}
+    mapping: dict = {}
+    confidence: dict = {}
+    for m in matches:
+        field = m.get("field") if isinstance(m, dict) else getattr(m, "field", None)
+        column = m.get("column") if isinstance(m, dict) else getattr(m, "column", None)
+        conf = m.get("confidence", 0) if isinstance(m, dict) else getattr(m, "confidence", 0)
+        if field in _TB_DETECT_FIELDS and column in valid_cols and field not in mapping:
+            mapping[field] = column
+            confidence[field] = round(float(conf or 0), 2)
+    return {"mapping": mapping, "confidence": confidence}
+
+
+@router.post("/tb/detect-columns")
+@limiter.limit(RATE_LIMIT_ASK)
+async def detect_tb_columns(
+    request: Request,
+    payload: schemas.TbDetectColumnsRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Suggest a column->field mapping for the TB import wizard from the uploaded
+    sheet's headers + a few sample rows. Maps columns ONLY — never alters a value;
+    an ambiguous column gets LOW confidence rather than a guess. Returns
+    { mapping: {field: column_letter}, confidence: {field: 0..1} }."""
+    await _load_session(db, payload.session_token)
+    await usage_meter.ensure_credits(db, payload.organization_id)
+
+    headers = [
+        {"column": h.get("column_index"), "label": h.get("label")}
+        for h in (payload.row_header or [])
+        if isinstance(h, dict)
+    ]
+    fields_block = "\n".join(f"- {k}: {v}" for k, v in _TB_DETECT_FIELDS.items())
+    prompt = (
+        "Map each spreadsheet COLUMN to at most one trial-balance import FIELD.\n\n"
+        f"ALLOWED FIELDS:\n{fields_block}\n\n"
+        f"COLUMN HEADERS (use the `column` letter in your answer):\n"
+        f"{json.dumps(headers, ensure_ascii=False)}\n\n"
+        f"SAMPLE ROWS:\n{json.dumps((payload.demo_rows or [])[:8], ensure_ascii=False, default=str)[:8000]}\n\n"
+        "Return matches as {field, column, confidence}. Map each field at most once. Only include "
+        "a match you are reasonably sure of; for an ambiguous column give a LOW confidence rather "
+        "than guessing. NEVER alter or compute any value — you only identify which column is which "
+        "field. Account-name headers may be in another language (e.g. Arabic)."
+    )
+    system = (
+        "You map spreadsheet columns to trial-balance import fields for an audit tool. You ONLY "
+        "identify which column is which field; you never change data. Use the exact field names "
+        "given and the exact column letters from the headers."
+    )
+    usage: dict = {}
+    result = await asyncio.to_thread(
+        structured.generate_structured,
+        prompt,
+        schemas.TbColumnDetection,
+        system=system,
+        usage_out=usage,
+    )
+    await usage_meter.record_usage(
+        db, organization_id=payload.organization_id, user_id=payload.user_id,
+        feature="tb_detect", tier="smart", usage=usage, request_id=uuid.uuid4().hex,
+    )
+
+    return _build_detect_result(result.matches, headers)

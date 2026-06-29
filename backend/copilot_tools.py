@@ -152,6 +152,29 @@ class CopilotContext:
             _data_cache.set(self._cache_key(endpoint, params), payload)
         return payload
 
+    def post(self, endpoint: str, json_body: Optional[dict] = None) -> Any:
+        """POST {base}/copilot/audit_files/{id}/{endpoint} with the grant header.
+        Used ONLY by approval-gated agent write tools. Returns the response `data`
+        payload, or an {"error": ...} dict (which the runtime treats as a failed
+        write and stops the run — never a half-written file)."""
+        url = f"{self.base_url}/copilot/audit_files/{self.audit_file_id}/{endpoint}"
+        headers = {"X-Copilot-Grant": self.grant}
+        timeout = (ONEAUDIT_HTTP_CONNECT_TIMEOUT, ONEAUDIT_HTTP_TIMEOUT)
+        try:
+            resp = requests.post(url, json=json_body or {}, headers=headers, timeout=timeout)
+        except requests.RequestException as exc:
+            logger.warning("copilot write error (%s): %s", endpoint, exc)
+            return {"error": f"Could not reach 1audit for '{endpoint}'."}
+        if resp.status_code != 200:
+            return {
+                "error": f"1audit returned HTTP {resp.status_code} for '{endpoint}'.",
+                "detail": _safe_json(resp),
+            }
+        body = _safe_json(resp)
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return body
+
     def validate_grant(self) -> None:
         """Confirm this request's grant is valid for this file via ONE real
         (uncached) summary fetch. Raises CopilotGrantError on an auth rejection

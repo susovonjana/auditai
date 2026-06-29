@@ -461,3 +461,107 @@ class UsageByUserPage(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+# =========================================================================
+# Supervised AI agent runtime
+# =========================================================================
+class AgentRunRequest(BaseModel):
+    """Start a run. The FE supplies a FRESH copilot grant on every call."""
+    session_token: str
+    audit_file_id: int
+    copilot_grant: str
+    agent_type: str
+    goal: Optional[str] = None
+    language: str = "en"  # en | ar
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+class AgentStepActionRequest(BaseModel):
+    """Approve / reject / abort. Carries a FRESH grant for any write it triggers
+    (required for approve/reject; optional for abort, which writes nothing)."""
+    session_token: str
+    copilot_grant: Optional[str] = None
+    edited_payload: Optional[dict] = None
+    note: Optional[str] = None
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+class AgentStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    idx: int
+    title: Optional[str] = None
+    type: str                              # read | compute | analysis | write
+    tool: Optional[str] = None
+    status: str
+    requires_approval: bool
+    output: Optional[Any] = None
+    proposed_write: Optional[Any] = None
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+
+
+class AgentRunOut(BaseModel):
+    id: UUID
+    status: str                            # planning|running|awaiting_approval|done|aborted|error
+    agent_type: str
+    goal: Optional[str] = None
+    audit_file_id: int
+    plan: Optional[Any] = None
+    steps: List[AgentStepOut] = []
+    result_summary: Optional[Any] = None
+    credits_used: int = 0
+    error_message: Optional[str] = None
+    # convenience for the FE: the step currently waiting (if any) + its preview
+    awaiting_step_idx: Optional[int] = None
+    proposed_write: Optional[Any] = None
+
+
+# =========================================================================
+# AI column auto-detect for the TB import wizard
+# =========================================================================
+class TbDetectColumnsRequest(BaseModel):
+    """The TB import preview (headers + a few sample rows); the model maps each
+    spreadsheet column to an import field. Mapping only — never alters a value."""
+    session_token: str
+    audit_file_id: Optional[int] = None
+    copilot_grant: Optional[str] = None
+    row_header: List[Any] = Field(default_factory=list)   # [{column_index, label}, ...]
+    demo_rows: List[Any] = Field(default_factory=list)
+    language: str = "en"
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_detect_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+class TbColumnMatch(BaseModel):
+    field: str = Field(description="one of the allowed system fields")
+    column: str = Field(description="the spreadsheet column letter (column_index) from the headers")
+    confidence: float = Field(description="0..1 confidence in this match")
+
+
+class TbColumnDetection(BaseModel):
+    matches: List[TbColumnMatch] = Field(default_factory=list)
