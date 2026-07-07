@@ -272,3 +272,141 @@ async def ensure_credits(db: AsyncSession, org_id: Optional[str]) -> None:
                 "remaining_credits": remaining,
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Read summary + admin management (powers the UI meter + the admin "AI Caps" tab)
+# ---------------------------------------------------------------------------
+# Allowance + used + period boundaries in one shot. The single-row derived table
+# LEFT JOINed to ai_org_quota guarantees exactly one result even when the org has
+# no row yet (COALESCE then fills the constant default / zero used). The monthly
+# reset is applied in-query, matching enforcement's date_trunc('month', now()).
+_SELECT_QUOTA_SUMMARY = text(
+    """
+    SELECT
+        COALESCE(q.monthly_credit_allowance, :default_allowance) AS allowance,
+        COALESCE(
+            CASE WHEN q.period_start < date_trunc('month', now())::date
+                 THEN 0 ELSE q.credits_used_this_period END,
+            0
+        ) AS used,
+        date_trunc('month', now())::date AS period_start,
+        (date_trunc('month', now()) + interval '1 month')::date AS resets_on
+    FROM (SELECT CAST(:org AS varchar) AS org) s
+    LEFT JOIN ai_org_quota q ON q.organization_id = s.org
+    """
+)
+
+# Set one org's allowance (per-org override), lazily creating the row. Usage +
+# period are preserved; the RETURNing CASE zeroes a stale prior-month period.
+_SET_ALLOWANCE = text(
+    """
+    INSERT INTO ai_org_quota
+        (organization_id, monthly_credit_allowance, period_start,
+         credits_used_this_period, status, updated_at)
+    VALUES
+        (:org, :allowance, date_trunc('month', now())::date, 0, 'active', now())
+    ON CONFLICT (organization_id) DO UPDATE SET
+        monthly_credit_allowance = EXCLUDED.monthly_credit_allowance,
+        updated_at = now()
+    RETURNING monthly_credit_allowance,
+        CASE WHEN period_start < date_trunc('month', now())::date
+             THEN 0 ELSE credits_used_this_period END AS used
+    """
+)
+
+
+async def get_org_credit_summary(db: AsyncSession, org_id: Optional[str]) -> dict:
+    """Everything the UI needs to render "X% used · resets <date>" for one org.
+    Returns {"metered": False} when metering is off or there is no org id (the UI
+    hides the meter); otherwise the full breakdown."""
+    if not AI_USAGE_METERING_ENABLED or not org_id:
+        return {"metered": False}
+    try:
+        row = (
+            await db.execute(
+                _SELECT_QUOTA_SUMMARY,
+                {"org": str(org_id), "default_allowance": AI_MONTHLY_CREDIT_ALLOWANCE_DEFAULT},
+            )
+        ).first()
+    except Exception as exc:  # never break the caller over a display read
+        logger.warning("usage_meter.get_org_credit_summary read failed (%s).", exc)
+        return {"metered": False}
+    allowance = int(row[0])
+    used = int(row[1])
+    remaining = max(0, allowance - used)
+    pct_used = round(min(100.0, used / allowance * 100.0), 1) if allowance > 0 else 100.0
+    return {
+        "metered": True,
+        "cap_enforced": AI_CREDIT_CAP_ENABLED,
+        "allowance": allowance,
+        "used": used,
+        "remaining": remaining,
+        "pct_used": pct_used,
+        "period_start": row[2],
+        "resets_on": row[3],
+    }
+
+
+async def set_org_allowance(
+    db: AsyncSession, org_id: str, monthly_credit_allowance: int
+) -> dict:
+    """Admin: set one org's monthly credit allowance (per-org override of the
+    constant default). Preserves the current period's usage, and refreshes the
+    balance cache so new headroom is honoured immediately by the pre-flight gate."""
+    allowance = max(0, int(monthly_credit_allowance))
+    row = (
+        await db.execute(_SET_ALLOWANCE, {"org": str(org_id), "allowance": allowance})
+    ).first()
+    await db.commit()
+    used = int(row[1]) if row else 0
+    remaining = max(0, allowance - used)
+    _balance_cache.set(str(org_id), remaining)  # keep ensure_credits/has_credits in sync
+    return {
+        "organization_id": str(org_id),
+        "allowance": allowance,
+        "used": used,
+        "remaining": remaining,
+    }
+
+
+async def list_org_quotas(
+    db: AsyncSession,
+    organization_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict:
+    """Admin table rows: every org that has a quota row (created lazily on first
+    AI use, or via an explicit override), with the monthly reset applied. Orgs
+    with no row simply run on the constant default and aren't listed here."""
+    where = "WHERE organization_id = :org" if organization_id else ""
+    filt = {"org": str(organization_id)} if organization_id else {}
+    total = (
+        await db.execute(text(f"SELECT count(*) FROM ai_org_quota {where}"), filt)
+    ).scalar() or 0
+    rows = (
+        await db.execute(
+            text(
+                f"""
+                SELECT organization_id,
+                       monthly_credit_allowance AS allowance,
+                       CASE WHEN period_start < date_trunc('month', now())::date
+                            THEN 0 ELSE credits_used_this_period END AS used
+                FROM ai_org_quota {where}
+                ORDER BY organization_id
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**filt, "limit": page_size, "offset": (page - 1) * page_size},
+        )
+    ).all()
+    items = [
+        {
+            "organization_id": r[0],
+            "allowance": int(r[1]),
+            "used": int(r[2]),
+            "remaining": max(0, int(r[1]) - int(r[2])),
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": int(total), "page": page, "page_size": page_size}

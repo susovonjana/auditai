@@ -152,6 +152,34 @@ class CopilotContext:
             _data_cache.set(self._cache_key(endpoint, params), payload)
         return payload
 
+    def post(self, endpoint: str, json_body: Optional[dict] = None, *, read_timeout: Optional[int] = None) -> Any:
+        """POST {base}/copilot/audit_files/{id}/{endpoint} with the grant header.
+        Used ONLY by approval-gated agent write tools. Returns the response `data`
+        payload, or an {"error": ...} dict (which the runtime treats as a failed
+        write and stops the run — never a half-written file).
+
+        ``read_timeout`` overrides the default per-call: bulk write transactions
+        (e.g. a 30-section program draft against the remote RDS) legitimately run
+        far longer than a read, and a client-side timeout is WORSE than waiting —
+        the be transaction still commits, leaving writes the run never recorded."""
+        url = f"{self.base_url}/copilot/audit_files/{self.audit_file_id}/{endpoint}"
+        headers = {"X-Copilot-Grant": self.grant}
+        timeout = (ONEAUDIT_HTTP_CONNECT_TIMEOUT, read_timeout or ONEAUDIT_HTTP_TIMEOUT)
+        try:
+            resp = requests.post(url, json=json_body or {}, headers=headers, timeout=timeout)
+        except requests.RequestException as exc:
+            logger.warning("copilot write error (%s): %s", endpoint, exc)
+            return {"error": f"Could not reach 1audit for '{endpoint}'."}
+        if resp.status_code != 200:
+            return {
+                "error": f"1audit returned HTTP {resp.status_code} for '{endpoint}'.",
+                "detail": _safe_json(resp),
+            }
+        body = _safe_json(resp)
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return body
+
     def validate_grant(self) -> None:
         """Confirm this request's grant is valid for this file via ONE real
         (uncached) summary fetch. Raises CopilotGrantError on an auth rejection
@@ -216,6 +244,18 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
     def get_risks() -> Any:
         return ctx.get("risks")
 
+    def get_audit_plan() -> Any:
+        return ctx.get("audit_plan")
+
+    def get_summary_of_controls() -> Any:
+        return ctx.get("summary_of_controls")
+
+    def get_journal_entries() -> Any:
+        return ctx.get("journal_entries")
+
+    def get_lead_schedules() -> Any:
+        return ctx.get("lead_schedules")
+
     def get_procedure_results(
         coa_original_id: Optional[int] = None, account: Optional[str] = None
     ) -> Any:
@@ -232,6 +272,17 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
 
     def get_working_paper(working_paper_id: int) -> Any:
         return ctx.get(f"working_papers/{int(working_paper_id)}/content")
+
+    def get_prior_program_sources(working_paper_id: int) -> Any:
+        # The best REAL program of THIS CLIENT to ground the draft on: the same
+        # WP in a prior-year (or current-year) file, else a sibling program as a
+        # structure-only reference. Templates are never scanned. Read-only.
+        return ctx.get(f"working_papers/{int(working_paper_id)}/prior_program_sources")
+
+    def get_org_procedure_seed(limit: Optional[int] = None) -> Any:
+        # Capped export of the org's OWN existing procedures (templates first)
+        # used once per org to seed the procedure house-style memory.
+        return ctx.get("org_procedure_seed", {"limit": limit} if limit else None)
 
     def get_audit_area(
         area: Optional[str] = None, coa_original_id: Optional[int] = None
@@ -278,10 +329,16 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
         "get_audit_file_summary": get_audit_file_summary,
         "get_trial_balance": get_trial_balance,
         "get_risks": get_risks,
+        "get_audit_plan": get_audit_plan,
+        "get_summary_of_controls": get_summary_of_controls,
+        "get_journal_entries": get_journal_entries,
+        "get_lead_schedules": get_lead_schedules,
         "get_procedure_results": get_procedure_results,
         "list_working_papers": list_working_papers,
         "get_financial_statement": get_financial_statement,
         "get_working_paper": get_working_paper,
+        "get_prior_program_sources": get_prior_program_sources,
+        "get_org_procedure_seed": get_org_procedure_seed,
         "get_audit_area": get_audit_area,
         "get_materiality": get_materiality,
         "get_review_points": get_review_points,
@@ -327,6 +384,54 @@ TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         name="get_risks",
         description="Assessed risks for this file (title, description, level).",
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_audit_plan",
+        description=(
+            "The AUDIT PLAN / strategy (ISA 300/315) for THIS file: the identified "
+            "risks mapped to the specific ACCOUNTS / AREAS they affect (by real "
+            "account name) and the assertions, with the assessment and risk level. "
+            "Use for 'what is the audit plan / strategy / approach for this file', "
+            "'which areas / accounts are the risk focus', or 'how are the risks "
+            "linked to accounts'. get_risks is the flat register; THIS is the "
+            "account-linked planning view."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_summary_of_controls",
+        description=(
+            "The internal-CONTROLS view (ISA 315/330) for THIS file: each business "
+            "/ accounting cycle with the controls tested — the control description, "
+            "whether the auditor RELIES on the control, the account it covers, and "
+            "how many control items / samples were tested. Use for 'what controls "
+            "were tested', 'which business cycles / controls', 'do we rely on "
+            "controls', or 'control weaknesses / deficiencies'."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_journal_entries",
+        description=(
+            "The manual JOURNAL ENTRIES register (ISA 240) for THIS file: each entry "
+            "with its transaction number, reference, notes, net debit / credit and "
+            "period, plus its line items (account name, description, debit, credit). "
+            "Use for 'what journal entries were recorded / tested', to spot large or "
+            "unusual entries, or to see which accounts a journal entry hits."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_lead_schedules",
+        description=(
+            "The LEAD SCHEDULES for THIS file: how the mapped trial-balance accounts "
+            "roll up into each financial-statement caption / lead sheet, with the "
+            "final current-year & prior-year balance, the year-over-year change, and "
+            "how many TB accounts map to each. Use for 'how does the trial balance "
+            "group into FS lines', 'what is in the <caption> lead sheet', or the "
+            "movement per caption."
+        ),
         parameters={"type": "object", "properties": {}},
     ),
     ToolSpec(
@@ -558,7 +663,7 @@ SYSTEM_FILE_ANSWER = (
     "1audit product-help questions.\n\n"
     "DECIDE THE SOURCE BEFORE CALLING ANY TOOL:\n"
     "1. ABOUT THIS FILE — its figures, balances, accounts, trial balance, "
-    "financial statements, working papers, risks, materiality, review points, "
+    "financial statements, working papers, risks, the audit plan / strategy, internal controls, journal entries, lead schedules, materiality, review points, "
     "analytical review, engagement team, samples, documents, sampling or audit areas, OR its "
     "profile / metadata (client, sector, currency, status, the file administrator "
     "/ manager or who created it, the audit period and "
@@ -566,7 +671,12 @@ SYSTEM_FILE_ANSWER = (
     "DUE DATE) — use the FILE tools: get_audit_file_summary (for the file's "
     "profile, dates, due date, AND the file administrator / who created it), "
     "get_trial_balance, get_financial_statement, "
-    "list_working_papers + get_working_paper, get_risks, get_audit_area, "
+    "list_working_papers + get_working_paper, get_risks, get_audit_plan (the "
+    "audit PLAN / strategy — the risks mapped to the accounts & assertions they "
+    "affect), get_summary_of_controls (the controls tested per business cycle + "
+    "whether we rely on them), get_journal_entries (the manual journal-entry "
+    "register + line items), get_lead_schedules (how the trial balance rolls up "
+    "into FS captions / lead sheets), get_audit_area, "
     "get_procedure_results, get_materiality (overall / performance / trivial "
     "materiality, cy & py), get_review_points (review / completion sign-off), "
     "get_analytical_review (variances + comments), get_engagement_team (members / "
@@ -736,7 +846,9 @@ _INTENT_SYSTEM = (
     "- its FIGURES: account balances, trial balance, financial-statement amounts, "
     "materiality (overall / performance / trivial), review points / sign-off "
     "status, analytical-review variances, the engagement team, samples, attached "
-    "documents, a working paper's recorded answers, assessed risks, sampling/exception "
+    "documents, a working paper's recorded answers, assessed risks, the audit "
+    "plan / strategy (risks mapped to accounts & assertions), the controls tested "
+    "/ summary of controls, journal entries, lead schedules, sampling/exception "
     "results; and\n"
     "- its METADATA / PROFILE: the client or entity name, sector, reporting "
     "currency, the audit period, ANY date (period start/end, prior-year period, "
@@ -824,7 +936,11 @@ WRITE_SYSTEM_PROMPT = (
     "performance / TRIVIAL materiality, cy & py), get_audit_file_summary (client, "
     "sector, currency, dates, due date, file administrator), get_trial_balance / "
     "get_financial_statement / get_audit_area (balances & account figures), "
-    "get_risks, get_review_points, get_analytical_review, get_engagement_team, "
+    "get_risks, get_audit_plan (audit plan / strategy — risks mapped to accounts "
+    "& assertions), get_summary_of_controls (controls tested + reliance), "
+    "get_journal_entries (manual journal-entry register), get_lead_schedules "
+    "(TB → FS caption roll-up), "
+    "get_review_points, get_analytical_review, get_engagement_team, "
     "get_sampling_design (samples / sample size), list_documents, or "
     "list_working_papers + get_working_paper for qualitative content. Only when "
     "the field is pure text-craft (rewrite, expand, shorten, fix tone or grammar, "

@@ -61,6 +61,7 @@ async def run(path: str) -> None:
                 assertions=rec.get("assertions") or [],
                 procedure_html=html,
                 confirmed_by=rec.get("confirmed_by"),
+                source="seed",
             )
             inserted += 1 if mem_id else 0
             skipped += 0 if mem_id else 1

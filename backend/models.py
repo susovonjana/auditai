@@ -184,6 +184,10 @@ class SearchHistory(Base):
     organization_id: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True, index=True
     )
+    # The audit file this question was asked INSIDE, if any (file-grounded chat via
+    # /copilot/chat). NULL for the general/KB chat (/ask). Powers per-file tagging
+    # and keeps file turns out of the general chat's conversation memory.
+    audit_file_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     # LLM token usage for this answer. 0 / NULL when no Gemini call happened
     # (small-talk replies, cache hits, empty-KB short-circuits).
     prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -251,6 +255,18 @@ class ProcMemory(Base):
     confirmed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
+    # Provenance: how the row entered the memory — "confirm" (auditor saved an
+    # AI-assisted procedure), "agent_approved" (procedure agent checkpoint
+    # approved), "seed" (bulk import of the org's existing procedures). NULL on
+    # legacy rows.
+    source: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Stable pointer to the origin (e.g. "agent:{run_id}:{temp_id}" or
+    # "seed:{audit_file_id}:{section_id}") — enables a future unlearn-on-undo.
+    source_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # sha256 over the normalized (audit_area + tag-stripped procedure text);
+    # paired with a partial unique index per org so cosmetic re-ingestion
+    # (markup/whitespace-only differences) is deduped at the database.
+    content_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class TbMappingMemory(Base):

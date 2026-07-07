@@ -73,6 +73,7 @@ from parser import (
     extract_blocks,
 )
 import schemas
+import usage_meter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -800,6 +801,40 @@ async def usage_by_user(
         page=page,
         page_size=page_size,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-org AI credit caps (the "AI Caps" admin tab). The env constant
+# AI_MONTHLY_CREDIT_ALLOWANCE_DEFAULT is the default for every org; these
+# endpoints view + override a specific org's monthly allowance (ai_org_quota).
+# ---------------------------------------------------------------------------
+@router.get("/organizations/quotas", response_model=schemas.OrgQuotaPage)
+async def list_org_quotas(
+    organization_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    result = await usage_meter.list_org_quotas(
+        db, organization_id=organization_id, page=page, page_size=page_size
+    )
+    return schemas.OrgQuotaPage(**result)
+
+
+@router.put(
+    "/organizations/{organization_id}/quota", response_model=schemas.OrgQuotaRow
+)
+async def set_org_quota(
+    organization_id: str,
+    payload: schemas.SetOrgQuotaRequest,
+    db: AsyncSession = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    result = await usage_meter.set_org_allowance(
+        db, organization_id, payload.monthly_credit_allowance
+    )
+    return schemas.OrgQuotaRow(**result)
 
 
 # ===========================================================================

@@ -103,6 +103,7 @@ async def init_db() -> None:
     """
     # Importing models registers them with Base.metadata
     import models  # noqa: F401
+    import agent.models  # noqa: F401   # agent runtime tables (agent_runs, agent_steps)
 
     await ensure_pgvector_extension()
     async with engine.begin() as conn:

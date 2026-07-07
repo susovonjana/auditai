@@ -138,6 +138,7 @@ async def _persist_ask_history(
     elapsed_ms: int,
     user_id: Optional[str] = None,
     organization_id: Optional[str] = None,
+    audit_file_id: Optional[int] = None,
 ) -> None:
     """Write the SearchHistory row + bump session counters AFTER the response
     has been sent. Uses a fresh AsyncSession because the request-scoped one
@@ -158,6 +159,7 @@ async def _persist_ask_history(
                 user_feedback=None,
                 user_id=user_id,
                 organization_id=organization_id,
+                audit_file_id=audit_file_id,
                 prompt_tokens=result.prompt_tokens or None,
                 completion_tokens=result.completion_tokens or None,
                 total_tokens=result.total_tokens or None,
@@ -501,10 +503,15 @@ async def session_history(
     db: AsyncSession = Depends(get_db),
 ):
     session = await _load_session(db, token)
+    # Strict per-user privacy: return ONLY the session owner's turns, so a shared
+    # browser/token can never surface another user's conversation.
+    conditions = [SearchHistory.session_id == session.id]
+    if session.user_id:
+        conditions.append(SearchHistory.user_id == session.user_id)
     rows = (
         await db.execute(
             select(SearchHistory)
-            .where(SearchHistory.session_id == session.id)
+            .where(*conditions)
             .order_by(SearchHistory.asked_at.asc())
         )
     ).scalars().all()
@@ -540,4 +547,10 @@ async def session_usage(
             SearchHistory.asked_at >= midnight,
         )
     total = (await db.execute(stmt)).scalar() or 0
-    return schemas.UserUsageResponse(total_tokens_today=int(total))
+    # Org AI-credit standing for the meter shown before generating. Keyed off the
+    # session's organization_id; returns metered=False when metering is off.
+    org_credit = await usage_meter.get_org_credit_summary(db, session.organization_id)
+    return schemas.UserUsageResponse(
+        total_tokens_today=int(total),
+        org_credit=schemas.OrgCreditSummary(**org_credit),
+    )

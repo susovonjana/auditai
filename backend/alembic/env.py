@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import DATABASE_URL  # noqa: E402
 from database import Base  # noqa: E402
 import models  # noqa: F401,E402   # ensure models register with metadata
+import agent.models  # noqa: F401,E402   # agent runtime tables register with metadata
 
 # Alembic Config object
 config = context.config

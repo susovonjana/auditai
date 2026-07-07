@@ -604,12 +604,18 @@ async def load_recent_history(
     db: AsyncSession,
     session_id: UUID,
     turns: int = CONVERSATION_MEMORY_TURNS,
+    general_only: bool = False,
 ) -> List[SearchHistory]:
-    """Return the last N Q&A turns for this session, oldest first."""
+    """Return the last N Q&A turns for this session, oldest first. When
+    general_only, file-grounded turns (audit_file_id set) are excluded so the
+    general chat's memory never inherits a specific file's data."""
+    conditions = [SearchHistory.session_id == session_id]
+    if general_only:
+        conditions.append(SearchHistory.audit_file_id.is_(None))
     rows = (
         await db.execute(
             select(SearchHistory)
-            .where(SearchHistory.session_id == session_id)
+            .where(*conditions)
             .order_by(desc(SearchHistory.asked_at))
             .limit(turns)
         )
@@ -754,7 +760,7 @@ async def answer_question(
     chunks = await retrieve_chunks(
         db, retrieval_query, question_embedding, TOP_K_CHUNKS, language=language
     )
-    history = await load_recent_history(db, session_id)
+    history = await load_recent_history(db, session_id, general_only=True)
 
     # No retrieved context does NOT end the turn: the model may still answer a
     # GENERAL professional concept from its own knowledge. Per the system prompt
@@ -903,7 +909,7 @@ async def prepare_stream(
     chunks = await retrieve_chunks(
         db, retrieval_query, question_embedding, TOP_K_CHUNKS, language=language
     )
-    history = await load_recent_history(db, session_id)
+    history = await load_recent_history(db, session_id, general_only=True)
     confidence, _ = _confidence_score(chunks)
     return StreamPreamble(
         question_embedding=question_embedding,

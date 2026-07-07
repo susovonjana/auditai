@@ -55,3 +55,62 @@ def test_search_examples_without_org_returns_empty():
             audit_area="Receivables", risk_summary="existence",
         )
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# Provenance + dedupe (Phase 2 feedback loop)
+# ---------------------------------------------------------------------------
+def test_content_hash_stable_under_markup_and_whitespace():
+    a = proc_memory.content_hash("Inventory", "<p>Attend the  count.</p>")
+    b = proc_memory.content_hash("Inventory", "<ol><li>Attend the count.</li></ol>")
+    c = proc_memory.content_hash("Inventory", "ATTEND THE COUNT.")
+    assert a == b == c
+    # wording change -> different hash
+    assert proc_memory.content_hash("Inventory", "<p>Attend the recount.</p>") != a
+    # the area participates in the hash
+    assert proc_memory.content_hash("Receivables", "<p>Attend the count.</p>") != a
+
+
+def test_extract_memory_rows_policy():
+    payload = {
+        "working_paper_id": 77,
+        "ai_run_id": "r1",
+        "sections": [
+            {"temp_id": "t1", "section_type": 1, "title": "General"},                       # title -> skipped
+            {"temp_id": "t2", "section_type": 3, "description": "<p>Objective: evidence over inventory quantities.</p>"},  # comment -> skipped
+            {"temp_id": "t3", "section_type": 2, "procedure": "<p>ok</p>"},                 # too short -> skipped
+            {"temp_id": "t4", "section_type": 2,
+             "procedure": "<p>Attend the year-end inventory count and observe the client's procedures.</p>",
+             "assertions": ["Existence", " Valuation ", ""]},
+        ],
+    }
+    rows = proc_memory.extract_memory_rows(
+        payload, run_id="RUN", audit_area="Inventory", risk_summary="obsolescence risk",
+        client_sector="Manufacturing", confirmed_by="27",
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["audit_area"] == "Inventory"
+    assert row["risk_summary"] == "obsolescence risk"
+    assert row["client_sector"] == "Manufacturing"
+    assert row["confirmed_by"] == "27"
+    assert row["assertions"] == ["Existence", "Valuation"]
+    assert row["source_key"] == "agent:RUN:t4"
+    assert row["procedure_html"].startswith("<p>Attend")
+
+
+def test_extract_memory_rows_caps_and_empty():
+    assert proc_memory.extract_memory_rows(
+        None, run_id="r", audit_area=None, risk_summary=None, client_sector=None, confirmed_by=None,
+    ) == []
+    many = {
+        "sections": [
+            {"temp_id": f"t{i}", "section_type": 2,
+             "procedure": f"<p>Perform detailed testing over balance number {i} with supporting evidence.</p>"}
+            for i in range(60)
+        ]
+    }
+    rows = proc_memory.extract_memory_rows(
+        many, run_id="r", audit_area="X", risk_summary=None, client_sector=None, confirmed_by=None,
+    )
+    assert len(rows) == 40  # _MAX_ROWS_PER_INGEST
