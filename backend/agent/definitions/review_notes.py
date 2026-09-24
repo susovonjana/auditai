@@ -23,7 +23,7 @@ from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
 
-from agent.types import PlannedStep, RunContext, register_definition
+from agent.types import PlannedStep, RunContext, language_directive, register_definition
 from structured import generate_structured
 
 
@@ -147,7 +147,7 @@ class ReviewNotesAgent:
         system = (
             "You are a senior engagement quality reviewer. Use ONLY the provided data; the counts were computed in code "
             "— never invent or recompute one. Raise precise, constructive review notes a preparer can act on."
-        )
+        ) + language_directive(ctx.language)
         review = generate_structured(prompt, EqrReview, system=system, usage_out=ctx.usage_out)
 
         notes_out = [

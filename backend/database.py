@@ -114,7 +114,7 @@ async def init_db() -> None:
             text(
                 """
                 CREATE INDEX IF NOT EXISTS document_chunks_embedding_idx
-                ON document_chunks
+                ON aura_document_chunks
                 USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 100)
                 """
@@ -126,7 +126,7 @@ async def init_db() -> None:
             text(
                 """
                 CREATE INDEX IF NOT EXISTS proc_memory_embedding_idx
-                ON proc_memory
+                ON aura_proc_memory
                 USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 100)
                 """
@@ -138,7 +138,7 @@ async def init_db() -> None:
             text(
                 """
                 CREATE INDEX IF NOT EXISTS tb_mapping_memory_embedding_idx
-                ON tb_mapping_memory
+                ON aura_tb_mapping_memory
                 USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 100)
                 """
@@ -151,7 +151,7 @@ async def init_db() -> None:
             text(
                 """
                 CREATE INDEX IF NOT EXISTS audit_file_chunks_embedding_idx
-                ON audit_file_chunks
+                ON aura_audit_file_chunks
                 USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 100)
                 """

@@ -1,12 +1,19 @@
 """
 SQLAlchemy ORM models for AuditAI.
 
-Five tables, exactly as defined in the project brief:
-  - documents
-  - document_chunks   (with VECTOR(1536) embedding column via pgvector)
-  - user_sessions
-  - search_history    (with VECTOR(1536) question_embedding column)
-  - admin_users
+NAMING CONVENTION: every table in this project's Postgres DB carries the
+``aura_`` prefix (aura_admin_users, aura_documents, ...) — set it directly in
+each model's ``__tablename__`` (and in ForeignKey strings). EVERY NEW TABLE
+must follow it. Existing tables were renamed by migration 014_aura_table_prefix.
+
+Core knowledge-base tables:
+  - aura_documents
+  - aura_document_chunks   (with VECTOR embedding column via pgvector)
+  - aura_user_sessions
+  - aura_search_history    (with VECTOR question_embedding column)
+  - aura_admin_users
+plus the memory / per-file RAG / metering tables below and the agent runtime
+tables in agent/models.py.
 """
 import uuid
 from datetime import datetime
@@ -37,7 +44,7 @@ from config import EMBEDDING_DIMENSIONS
 # Table 1: documents
 # ---------------------------------------------------------------------------
 class Document(Base):
-    __tablename__ = "documents"
+    __tablename__ = "aura_documents"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -74,14 +81,14 @@ class Document(Base):
 # Table 2: document_chunks  (the heart of the knowledge base)
 # ---------------------------------------------------------------------------
 class DocumentChunk(Base):
-    __tablename__ = "document_chunks"
+    __tablename__ = "aura_document_chunks"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("documents.id", ondelete="CASCADE"),
+        ForeignKey("aura_documents.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -97,6 +104,9 @@ class DocumentChunk(Base):
     chunk_type: Mapped[str] = mapped_column(
         Text, nullable=False, default="text"
     )  # "text" | "table"
+    # New in migration 015 — help-center page for this chunk's article, so
+    # answers can link the user to the full walkthrough ("Learn more").
+    help_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -108,7 +118,7 @@ class DocumentChunk(Base):
 # Table 3: user_sessions
 # ---------------------------------------------------------------------------
 class UserSession(Base):
-    __tablename__ = "user_sessions"
+    __tablename__ = "aura_user_sessions"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -152,14 +162,14 @@ class UserSession(Base):
 # Table 4: search_history
 # ---------------------------------------------------------------------------
 class SearchHistory(Base):
-    __tablename__ = "search_history"
+    __tablename__ = "aura_search_history"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     session_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("user_sessions.id", ondelete="CASCADE"),
+        ForeignKey("aura_user_sessions.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -204,7 +214,7 @@ class SearchHistory(Base):
 # Table 5: admin_users
 # ---------------------------------------------------------------------------
 class AdminUser(Base):
-    __tablename__ = "admin_users"
+    __tablename__ = "aura_admin_users"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -235,7 +245,7 @@ class ProcMemory(Base):
     Strictly org-scoped and purely additive: rows live only in auditai's own
     Postgres, are never read or written by 1audit, and are only appended to (no
     update/delete in app code)."""
-    __tablename__ = "proc_memory"
+    __tablename__ = "aura_proc_memory"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -284,7 +294,7 @@ class TbMappingMemory(Base):
     Strictly org-scoped and purely additive: rows live only in auditai's own
     Postgres, are never read or written by 1audit, and are only appended to (no
     update/delete in app code)."""
-    __tablename__ = "tb_mapping_memory"
+    __tablename__ = "aura_tb_mapping_memory"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -326,7 +336,7 @@ class AiUsageLedger(Base):
     Purely additive: a new table in auditai's own Postgres, never read/written
     by 1audit. The canonical DDL also lives in
     migrations/004_ai_credit_metering.sql (used for prod / manual apply)."""
-    __tablename__ = "ai_usage_ledger"
+    __tablename__ = "aura_ai_usage_ledger"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -368,7 +378,7 @@ class AiOrgQuota(Base):
 
     Orgs with no row fall back to AI_MONTHLY_CREDIT_ALLOWANCE_DEFAULT; a row is
     created lazily on first use. Purely additive (auditai Postgres only)."""
-    __tablename__ = "ai_org_quota"
+    __tablename__ = "aura_ai_org_quota"
 
     organization_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     monthly_credit_allowance: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -396,7 +406,7 @@ class AuditFileChunk(Base):
     reindex (the file's content changes as auditors work), so rows are transient
     cache, never a source of truth — 1audit-be remains authoritative. Purely
     additive: lives only in auditai's own Postgres."""
-    __tablename__ = "audit_file_chunks"
+    __tablename__ = "aura_audit_file_chunks"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -424,7 +434,7 @@ class AuditFileIndex(Base):
     content hash (to skip re-embedding when nothing material changed), the chunk
     count and when it was built. Lets search_file decide cheaply whether to reuse
     the existing chunks or rebuild. Purely additive (auditai Postgres only)."""
-    __tablename__ = "audit_file_index"
+    __tablename__ = "aura_audit_file_index"
 
     audit_file_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     signature: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -446,7 +456,7 @@ class AuditFileCacheState(Base):
     in-memory data cache when it's newer. Shared source of truth so the
     invalidation is correct across multiple auditai workers. Purely additive
     (auditai Postgres only)."""
-    __tablename__ = "audit_file_cache_state"
+    __tablename__ = "aura_audit_file_cache_state"
 
     audit_file_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     changed_at: Mapped[datetime] = mapped_column(

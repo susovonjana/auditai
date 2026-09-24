@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from agent.types import PlannedStep, RunContext, register_definition
+from agent.types import PlannedStep, RunContext, language_directive, register_definition
 from agent.definitions.file_review import _num
 from structured import generate_structured
 
@@ -303,7 +303,7 @@ class SubstantiveTestingAgent:
         system = (
             "You are a senior auditor evaluating substantive testing. Use ONLY the figures provided (computed in code). "
             "Never compute, estimate, or invent a number. Be concise, specific, and conclusion-oriented."
-        )
+        ) + language_directive(ctx.language)
         draft = generate_structured(prompt, TestingDraft, system=system, usage_out=ctx.usage_out)
         return {
             "summary": draft.summary,

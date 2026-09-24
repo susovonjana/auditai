@@ -239,3 +239,6 @@ Thumbs.db
 
 # Local tooling
 .claude/
+
+# Local deployment script (machine-specific)
+deploy-dev.sh

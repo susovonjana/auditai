@@ -33,6 +33,7 @@ class ParsedChunk:
     page_number: Optional[int] = None
     section_heading: Optional[str] = None
     char_count: int = 0
+    help_url: Optional[str] = None               # in-app help page for this section
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,7 @@ def chunk_blocks(blocks: List[ParsedBlock]) -> List[ParsedChunk]:
                     page_number=block.page_number,
                     section_heading=section,
                     char_count=len(content),
+                    help_url=block.help_url,
                 )
             )
             idx += 1
@@ -153,6 +155,7 @@ def chunk_blocks(blocks: List[ParsedBlock]) -> List[ParsedChunk]:
                         page_number=block.page_number,
                         section_heading=section,
                         char_count=len(piece),
+                        help_url=block.help_url,
                     )
                 )
                 idx += 1

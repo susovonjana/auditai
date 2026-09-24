@@ -74,7 +74,7 @@ def credits_for(tier: str, input_tokens: int, output_tokens: int) -> int:
 # via the partial unique index, so retries don't double-charge.
 _INSERT_LEDGER = text(
     """
-    INSERT INTO ai_usage_ledger
+    INSERT INTO aura_ai_usage_ledger
         (id, organization_id, user_id, feature, tier, model,
          input_tokens, output_tokens, credits, request_id, created_at)
     VALUES
@@ -90,21 +90,21 @@ _INSERT_LEDGER = text(
 # refresh the cache precisely.
 _UPSERT_QUOTA = text(
     """
-    INSERT INTO ai_org_quota
+    INSERT INTO aura_ai_org_quota
         (organization_id, monthly_credit_allowance, period_start,
          credits_used_this_period, status, updated_at)
     VALUES
         (:org, :default_allowance, date_trunc('month', now())::date, :credits, 'active', now())
     ON CONFLICT (organization_id) DO UPDATE SET
         credits_used_this_period = CASE
-            WHEN ai_org_quota.period_start < date_trunc('month', now())::date
+            WHEN aura_ai_org_quota.period_start < date_trunc('month', now())::date
                 THEN EXCLUDED.credits_used_this_period
-            ELSE ai_org_quota.credits_used_this_period + EXCLUDED.credits_used_this_period
+            ELSE aura_ai_org_quota.credits_used_this_period + EXCLUDED.credits_used_this_period
         END,
         period_start = CASE
-            WHEN ai_org_quota.period_start < date_trunc('month', now())::date
+            WHEN aura_ai_org_quota.period_start < date_trunc('month', now())::date
                 THEN date_trunc('month', now())::date
-            ELSE ai_org_quota.period_start
+            ELSE aura_ai_org_quota.period_start
         END,
         updated_at = now()
     RETURNING monthly_credit_allowance, credits_used_this_period
@@ -118,7 +118,7 @@ _SELECT_QUOTA = text(
     SELECT monthly_credit_allowance,
            CASE WHEN period_start < date_trunc('month', now())::date
                 THEN 0 ELSE credits_used_this_period END AS used
-    FROM ai_org_quota
+    FROM aura_ai_org_quota
     WHERE organization_id = :org
     """
 )
@@ -293,7 +293,7 @@ _SELECT_QUOTA_SUMMARY = text(
         date_trunc('month', now())::date AS period_start,
         (date_trunc('month', now()) + interval '1 month')::date AS resets_on
     FROM (SELECT CAST(:org AS varchar) AS org) s
-    LEFT JOIN ai_org_quota q ON q.organization_id = s.org
+    LEFT JOIN aura_ai_org_quota q ON q.organization_id = s.org
     """
 )
 
@@ -301,7 +301,7 @@ _SELECT_QUOTA_SUMMARY = text(
 # period are preserved; the RETURNing CASE zeroes a stale prior-month period.
 _SET_ALLOWANCE = text(
     """
-    INSERT INTO ai_org_quota
+    INSERT INTO aura_ai_org_quota
         (organization_id, monthly_credit_allowance, period_start,
          credits_used_this_period, status, updated_at)
     VALUES
@@ -382,7 +382,7 @@ async def list_org_quotas(
     where = "WHERE organization_id = :org" if organization_id else ""
     filt = {"org": str(organization_id)} if organization_id else {}
     total = (
-        await db.execute(text(f"SELECT count(*) FROM ai_org_quota {where}"), filt)
+        await db.execute(text(f"SELECT count(*) FROM aura_ai_org_quota {where}"), filt)
     ).scalar() or 0
     rows = (
         await db.execute(
@@ -392,7 +392,7 @@ async def list_org_quotas(
                        monthly_credit_allowance AS allowance,
                        CASE WHEN period_start < date_trunc('month', now())::date
                             THEN 0 ELSE credits_used_this_period END AS used
-                FROM ai_org_quota {where}
+                FROM aura_ai_org_quota {where}
                 ORDER BY organization_id
                 LIMIT :limit OFFSET :offset
                 """

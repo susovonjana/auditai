@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from agent.types import PlannedStep, RunContext, register_definition
+from agent.types import PlannedStep, RunContext, language_directive, register_definition
 from agent.definitions.file_review import _num
 from structured import generate_structured
 
@@ -167,7 +167,7 @@ class RiskAssessmentAgent:
             "You are a senior auditor assessing risks of material misstatement. Reason about risk qualitatively, but "
             "cite ONLY the figures provided (computed in code) and never invent or recompute a number. Prioritise "
             "material balances and large movements; be specific and link each risk to assertions and a response."
-        )
+        ) + language_directive(ctx.language)
         report = generate_structured(prompt, RiskAssessment, system=system, usage_out=ctx.usage_out)
 
         risks_out = []

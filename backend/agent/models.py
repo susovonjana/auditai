@@ -31,7 +31,7 @@ from database import Base
 # agent_runs — one supervised run of one agent over one audit file
 # ---------------------------------------------------------------------------
 class AgentRun(Base):
-    __tablename__ = "agent_runs"
+    __tablename__ = "aura_agent_runs"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -98,14 +98,14 @@ class AgentRun(Base):
 # agent_steps — one planned step (read / compute / analysis / write)
 # ---------------------------------------------------------------------------
 class AgentStep(Base):
-    __tablename__ = "agent_steps"
+    __tablename__ = "aura_agent_steps"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("agent_runs.id", ondelete="CASCADE"),
+        ForeignKey("aura_agent_runs.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )

@@ -4,7 +4,7 @@ on:
   push:
     branches: 
       - master  # REPLACE this with your actual deployment branch, secrets not supported here
-
+      - dev-deployment
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_ACCOUNT_ID: ${{ secrets.ECR_ACCOUNT_ID }}
@@ -23,6 +23,11 @@ jobs:
           if [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
             echo "ECR_REPOSITORY_NAME=aura2" >> $GITHUB_ENV            
             echo "IMAGE_TAG=aura2-latest-$(date +'%Y-%m-%d-%H-%M')" >> $GITHUB_ENV
+          elif [[ "${{ github.ref }}" == "refs/heads/dev-deployment" ]]; then
+            echo "ECR_REPOSITORY_NAME=dev/aura" >> $GITHUB_ENV
+            echo "IMAGE_TAG=aura2-dev-latest-$(date +'%Y-%m-%d-%H-%M')" >> $GITHUB_ENV
+          else
+            echo "This workflow only runs on the master or dev-deployment branches."
           fi
 
       - name: Configure AWS credentials

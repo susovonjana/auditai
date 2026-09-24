@@ -516,6 +516,9 @@ class AgentStepActionRequest(BaseModel):
     note: Optional[str] = None
     user_id: Optional[str] = None
     organization_id: Optional[str] = None
+    # the approving user's UI language — post-approval synthesis (the run's
+    # final report) is written in it
+    language: str = "en"
 
     @field_validator("user_id", "organization_id", mode="before")
     @classmethod
@@ -604,3 +607,59 @@ class OrgQuotaPage(BaseModel):
 
 class SetOrgQuotaRequest(BaseModel):
     monthly_credit_allowance: int = Field(ge=0)
+
+
+# =========================================================================
+# Support desk — AI assist (POST /support/assist)
+# Called server-to-server by the support system's backend, which builds the
+# ticket context under its own access rules and sends it here. No session token.
+# =========================================================================
+class SupportMessage(BaseModel):
+    """One turn of the ticket conversation (internal notes never arrive here)."""
+    role: str = Field(..., pattern="^(customer|agent)$")
+    name: Optional[str] = Field(None, max_length=200)
+    text: str = Field(..., max_length=4000)
+    at: Optional[str] = Field(None, max_length=40)  # ISO timestamp, informational
+
+
+class SupportTicketContext(BaseModel):
+    number: Optional[str] = Field(None, max_length=40)
+    subject: Optional[str] = Field(None, max_length=300)
+    description: Optional[str] = Field(None, max_length=3000)  # plain text
+    product: Optional[str] = Field(None, max_length=60)        # human label
+    status: Optional[str] = Field(None, max_length=60)
+    priority: Optional[str] = Field(None, max_length=60)
+    category: Optional[str] = Field(None, max_length=80)
+    customer_name: Optional[str] = Field(None, max_length=200)
+    agent_name: Optional[str] = Field(None, max_length=200)
+
+
+class SupportKbArticle(BaseModel):
+    """A support-desk knowledge-base article the desk found relevant."""
+    title: str = Field(..., max_length=300)
+    text: str = Field(..., max_length=4000)
+
+
+class SupportAssistRequest(BaseModel):
+    mode: str = Field(..., pattern="^(ask|write|reply)$")   # reply = one-click auto reply
+    language: str = Field("en", pattern="^(en|ar)$")   # reply language
+    translate: bool = False                            # write: translate the draft only
+    # Whether the 1audit help manual covers this ticket's product. False for the
+    # other products (aninvoice, legacy): their replies must not be grounded in
+    # another product's manual.
+    help_manual: bool = True
+    question: Optional[str] = Field(None, max_length=2000)   # ask
+    draft: Optional[str] = Field(None, max_length=8000)      # write: the agent's current text
+    instruction: Optional[str] = Field(None, max_length=1000)  # write: what the agent typed
+    ticket: SupportTicketContext = Field(default_factory=SupportTicketContext)
+    conversation: List[SupportMessage] = Field(default_factory=list, max_length=20)
+    kb_articles: List[SupportKbArticle] = Field(default_factory=list, max_length=5)
+    caller_user_id: Optional[str] = None   # support-desk user id, for the usage ledger
+    request_id: Optional[str] = Field(None, max_length=64)
+
+    @field_validator("caller_user_id", mode="before")
+    @classmethod
+    def _stringify_caller(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)

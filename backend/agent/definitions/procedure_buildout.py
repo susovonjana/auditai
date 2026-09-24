@@ -604,6 +604,9 @@ class ProcedureBuildOutAgent:
             secondary_language=config_facts.get("secondary_language"),
             prior_program=prior,
             template_mode=bool(ctx.is_template),
+            # checkpoint prose (config_summary + rationale) is read by the
+            # auditor RUNNING the agent — written in their UI language
+            reviewer_language=ctx.language,
         )
         plan = generate_structured(
             prompt, ProcedurePlan,
@@ -640,35 +643,67 @@ class ProcedureBuildOutAgent:
         created = write_res.get("count", 0) if isinstance(write_res, dict) else 0
         rejected = isinstance(write_res, dict) and write_res.get("rejected") is True
 
+        # report prose is written once — in the RUNNING user's UI language
+        _ar = str(ctx.language or "").lower().startswith("ar")
+
+        def _bi(en: str, ar: str) -> str:
+            return ar if _ar else en
+
         needs_attention: List[str] = list(draft.get("validation_notes", []) if isinstance(draft, dict) else [])
         unmatched = write_res.get("unmatched_assertions") if isinstance(write_res, dict) else None
         if unmatched:
-            needs_attention.append(f"assertion names not found in this organization: {', '.join(unmatched)}")
+            needs_attention.append(_bi(
+                f"assertion names not found in this organization: {', '.join(unmatched)}",
+                f"أسماء إفادات غير موجودة في هذه المنشأة: {'، '.join(unmatched)}",
+            ))
         if rejected:
-            needs_attention.append("the draft was rejected at the checkpoint — nothing was written")
+            needs_attention.append(_bi(
+                "the draft was rejected at the checkpoint — nothing was written",
+                "رُفضت المسودة عند نقطة الموافقة — لم يُكتب أي شيء",
+            ))
 
         grounding = draft.get("grounding") if isinstance(draft, dict) else None
         source = (grounding or {}).get("source") if isinstance(grounding, dict) else None
         if isinstance(grounding, dict) and not source:
             needs_attention.append(
-                "no reference program of the firm was found to learn from — "
-                "the draft was built from professional standards and firm style only"
+                _bi(
+                    "no reference program of the firm was found to learn from — "
+                    "the draft was built from professional standards and firm style only",
+                    "لم يُعثر على برنامج مرجعي للمنشأة للاستناد إليه — "
+                    "أُعدت المسودة من المعايير المهنية وأسلوب المنشأة فقط",
+                )
                 if ctx.is_template
-                else "no earlier program of this client was found to learn from — "
-                "the draft was built from this file's risk data and firm style only"
+                else _bi(
+                    "no earlier program of this client was found to learn from — "
+                    "the draft was built from this file's risk data and firm style only",
+                    "لم يُعثر على برنامج سابق لهذا العميل للاستناد إليه — "
+                    "أُعدت المسودة من بيانات مخاطر هذا الملف وأسلوب المنشأة فقط",
+                )
             )
 
         if created:
-            grounded_on = f"Grounded on {source['label']}. " if source and source.get("label") else ""
-            summary = (
-                f"{grounded_on}Created {created} section(s) in the working paper: {counts.get('titles', 0)} title(s) and "
+            grounded_on = (
+                (_bi(f"Grounded on {source['label']}. ", f"استنادًا إلى {source['label']}. "))
+                if source and source.get("label") else ""
+            )
+            summary = grounded_on + _bi(
+                f"Created {created} section(s) in the working paper: {counts.get('titles', 0)} title(s) and "
                 f"{counts.get('procedures', 0)} procedure(s), {counts.get('with_response_sets', 0)} with a tailored "
-                f"response set. Undo is available for this run."
+                f"response set. Undo is available for this run.",
+                f"تم إنشاء {created} قسمًا في ورقة العمل: {counts.get('titles', 0)} عناوين و"
+                f"{counts.get('procedures', 0)} إجراءات، منها {counts.get('with_response_sets', 0)} بمجموعة استجابة مخصصة. "
+                f"التراجع متاح لهذه العملية.",
             )
         elif rejected:
-            summary = "The proposed program was rejected at the approval checkpoint; the working paper is unchanged."
+            summary = _bi(
+                "The proposed program was rejected at the approval checkpoint; the working paper is unchanged.",
+                "رُفض البرنامج المقترح عند نقطة الموافقة؛ ورقة العمل لم تتغير.",
+            )
         else:
-            summary = "The run finished without writing to the working paper."
+            summary = _bi(
+                "The run finished without writing to the working paper.",
+                "انتهت العملية دون الكتابة في ورقة العمل.",
+            )
 
         return {
             "summary": summary,

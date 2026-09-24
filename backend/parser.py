@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +97,27 @@ class ParsedBlock:
     block_type: str = "text"          # "text" | "table" | "heading"
     page_number: Optional[int] = None
     section_heading: Optional[str] = None
+    help_url: Optional[str] = None    # help-page SLUG for this section
+
+
+# A "Help page: <slug>" (or Arabic "صفحة المساعدة: <slug>") marker inside a
+# document attaches that help-page SLUG to every block until the next
+# top-level heading. The prepared KB export emits one per article. We store the
+# slug only (language- and domain-agnostic); the full clickable URL is built at
+# answer time from the answer's language. Also tolerates a legacy full URL
+# (older exports embedded "https://…/help/<slug>") by taking its last segment.
+_HELP_URL_RE = re.compile(
+    r"(?:Help page|صفحة المساعدة)\s*[::]\s*(\S+)",
+    flags=re.IGNORECASE,
+)
+
+
+def _help_slug(token: str) -> str:
+    """Normalise a marker value to a bare slug (strip a full URL / trailing punct)."""
+    token = token.strip().rstrip(".,;)")
+    if "://" in token or "/" in token:
+        token = token.rstrip("/").rsplit("/", 1)[-1]
+    return token
 
 
 class UnsupportedFileTypeError(Exception):
@@ -364,6 +386,7 @@ def _extract_docx(path: Path) -> List[ParsedBlock]:
     doc = Document(str(path))
     blocks: List[ParsedBlock] = []
     current_heading: Optional[str] = None
+    current_help_url: Optional[str] = None
 
     # Iterate body children in original document order
     body = doc.element.body
@@ -378,6 +401,12 @@ def _extract_docx(path: Path) -> List[ParsedBlock]:
             if style.lower().startswith("heading") or style.lower() == "title":
                 # Track heading as context but don't emit it as its own searchable block
                 current_heading = text
+                # A top-level heading (Title / Heading 1-2) starts a new article;
+                # its help link, if any, follows in the article intro. Deeper
+                # headings (3+) are subsections and keep the article's link.
+                level_digits = re.sub(r"\D", "", style)
+                if not level_digits or int(level_digits) <= 2:
+                    current_help_url = None
                 blocks.append(
                     ParsedBlock(
                         content=text,
@@ -386,11 +415,15 @@ def _extract_docx(path: Path) -> List[ParsedBlock]:
                     )
                 )
             else:
+                m = _HELP_URL_RE.search(text)
+                if m:
+                    current_help_url = _help_slug(m.group(1))
                 blocks.append(
                     ParsedBlock(
                         content=text,
                         block_type="text",
                         section_heading=current_heading,
+                        help_url=current_help_url,
                     )
                 )
         elif tag == "tbl":
@@ -403,6 +436,7 @@ def _extract_docx(path: Path) -> List[ParsedBlock]:
                         content=md,
                         block_type="table",
                         section_heading=current_heading,
+                        help_url=current_help_url,
                     )
                 )
     return blocks

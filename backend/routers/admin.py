@@ -343,6 +343,7 @@ async def _process_document_background(doc_id: uuid.UUID) -> None:
                         page_number=pc.page_number,
                         section_heading=pc.section_heading,
                         chunk_type=pc.chunk_type,
+                        help_url=pc.help_url,
                     )
                 )
 

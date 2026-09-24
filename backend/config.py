@@ -81,6 +81,18 @@ ONEAUDIT_BASE_URL: str = os.getenv(
 ONEAUDIT_HTTP_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_TIMEOUT", "15"))
 ONEAUDIT_HTTP_CONNECT_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_CONNECT_TIMEOUT", "5"))
 
+# --- Help-center "Learn more" links ---
+# The knowledge base stores only a help-page SLUG (e.g. "settings-general-
+# information") per chunk — language- and domain-agnostic. The full clickable
+# URL is assembled at ANSWER time from the answer's language, because the live
+# help route is language-prefixed (FE: /{lang}/app/knowledge_base/helps/{slug}).
+# {lang} → "en"|"ar", {slug} → the stored slug. Override per environment (prod
+# domain) via env. Set to "" to disable Learn-more links entirely.
+HELP_CENTER_URL_TEMPLATE: str = os.getenv(
+    "HELP_CENTER_URL_TEMPLATE",
+    "https://beta.1audit.com/{lang}/app/knowledge_base/helps/{slug}",
+)
+
 # Shared secret used by 1audit-be to SIGN copilot grants (HS256). When set here
 # (must MATCH be's COPILOT_GRANT_SECRET / JWT_LOGIN_SECRET), auditai verifies the
 # grant's signature locally — no per-question /summary round-trip to be. When
@@ -93,6 +105,13 @@ COPILOT_GRANT_SECRET: str = os.getenv("COPILOT_GRANT_SECRET", "") or ""
 # the X-Internal-Secret header (its AUDITAI_INTERNAL_SECRET). When unset, the
 # internal endpoints are disabled (fail closed).
 INTERNAL_SHARED_SECRET: str = os.getenv("INTERNAL_SHARED_SECRET", "") or ""
+
+# Shared secret protecting the SUPPORT-DESK endpoints (/support/*), which the
+# support system's backend calls server-to-server (its AUDITAI_SUPPORT_SECRET,
+# sent in the X-Support-Secret header). Deliberately distinct from
+# INTERNAL_SHARED_SECRET so the support desk cannot reach /internal/*. When
+# unset, /support/* answers 503 (fail closed).
+SUPPORT_SHARED_SECRET: str = os.getenv("SUPPORT_SHARED_SECRET", "") or ""
 
 # Short-TTL cache for the file-mode chat's data fetches. Within this window a
 # repeated tool call (same file + endpoint + args) is served from memory instead
@@ -245,6 +264,16 @@ RATE_LIMIT_SESSION_START: str = os.getenv("RATE_LIMIT_SESSION_START", "10/minute
 RATE_LIMIT_ADMIN_LOGIN: str = os.getenv("RATE_LIMIT_ADMIN_LOGIN", "5/minute;30/hour")
 RATE_LIMIT_ADMIN_UPLOAD: str = os.getenv("RATE_LIMIT_ADMIN_UPLOAD", "20/hour")
 RATE_LIMIT_TRANSLATE: str = os.getenv("RATE_LIMIT_TRANSLATE", "60/hour;500/day")
+# Support-desk assist (routers/support.py). Keyed by the support USER (the
+# X-Support-User header), not by IP: every agent arrives through the support
+# backend's single egress IP, so a per-IP bucket would be shared by the whole
+# desk. This is a circuit breaker; the desk applies its own per-user limit first.
+RATE_LIMIT_SUPPORT_ASSIST: str = os.getenv("RATE_LIMIT_SUPPORT_ASSIST", "600/hour;5000/day")
+# Help-manual excerpts handed to the model per answer, the output cap (a support
+# reply is short), and the org id usage is recorded under in the ledger.
+SUPPORT_ASSIST_TOP_K: int = int(os.getenv("SUPPORT_ASSIST_TOP_K", "6"))
+SUPPORT_ASSIST_MAX_TOKENS: int = int(os.getenv("SUPPORT_ASSIST_MAX_TOKENS", "1200"))
+SUPPORT_ASSIST_ORG_ID: str = os.getenv("SUPPORT_ASSIST_ORG_ID", "support")
 
 # Per-session hard cap (cheaper than per-IP — applies even if same IP rotates tokens)
 MAX_QUESTIONS_PER_SESSION_DAY: int = int(

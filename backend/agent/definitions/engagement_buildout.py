@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from agent.types import PlannedStep, RunContext, register_definition
+from agent.types import PlannedStep, RunContext, language_directive, register_definition
 from agent.definitions.file_review import _extract_lines  # shared, tolerant FS parser
 from structured import generate_structured
 
@@ -192,7 +192,7 @@ class EngagementBuildOutAgent:
             "You are a senior auditor's assistant. Recommend materiality benchmark options grounded "
             "in the provided figures; never compute or assert a final materiality amount. Use ONLY the "
             "values provided."
-        )
+        ) + language_directive(ctx.language)
         out = generate_structured(prompt, MaterialitySuggestion, system=system, usage_out=ctx.usage_out)
         return out.model_dump(mode="json")
 
@@ -224,7 +224,7 @@ class EngagementBuildOutAgent:
             "and note the materiality recommendation. Then list concrete 'needs attention' items.",
             BuildOutNarrative,
             system="You are a senior auditor's assistant. Use ONLY the provided facts; never invent or "
-                   "recompute a figure. Be concise and specific.",
+                   "recompute a figure. Be concise and specific." + language_directive(ctx.language),
             usage_out=ctx.usage_out,
         )
         return {

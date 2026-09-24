@@ -679,6 +679,11 @@ async def map_trial_balance(
     semantics + frequency prior (both deterministic, no Gemini), and an optional
     Tier-3 LLM tail. Returns suggestions only — 1audit-be persists after the
     auditor confirms. Never suggests a coa_original_id outside the candidate set."""
+    print(
+        f"[tb-mapping] called from client={request.client.host if request.client else 'unknown'} "
+        f"origin={request.headers.get('origin')} referer={request.headers.get('referer')} "
+        f"user-agent={request.headers.get('user-agent')}"
+    )
     # Trusted server-to-server call from 1audit-be. A session token, when present,
     # is validated for rate-limit scoping; absent is allowed (be already authorized).
     if payload.session_token:

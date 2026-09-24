@@ -29,6 +29,7 @@ from routers import agent as agent_router
 from routers import copilot as copilot_router
 from routers import health as health_router
 from routers import internal as internal_router
+from routers import support as support_router
 from routers import user as user_router
 
 logging.basicConfig(
@@ -156,7 +157,8 @@ allowed_origins = [
     "http://localhost:3000",
     "http://localhost:3002",       # 1audit dev port
     "http://127.0.0.1:3002",
-    "https://beta.1audit.com/"
+    "https://beta.1audit.com",
+    "https://dev.1audit.com"
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -173,6 +175,7 @@ app.include_router(user_router.router)
 app.include_router(copilot_router.router)
 app.include_router(internal_router.router)
 app.include_router(agent_router.router)
+app.include_router(support_router.router)
 
 
 @app.get("/")
@@ -230,12 +233,12 @@ async def run_migrations(
             ))).scalars().all()
             user_sessions_cols = (await conn.execute(text(
                 "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name='user_sessions' "
+                "WHERE table_schema='public' AND table_name='aura_user_sessions' "
                 "ORDER BY ordinal_position"
             ))).scalars().all()
             search_history_cols = (await conn.execute(text(
                 "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name='search_history' "
+                "WHERE table_schema='public' AND table_name='aura_search_history' "
                 "ORDER BY ordinal_position"
             ))).scalars().all()
             try:
@@ -257,17 +260,17 @@ async def run_migrations(
         # Safe to run multiple times. Use when create_all() built tables before
         # migrations were written, so columns the models expect aren't in the DB.
         statements = [
-            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS user_id TEXT',
-            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS organization_id TEXT',
-            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER',
-            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS completion_tokens INTEGER',
-            'ALTER TABLE search_history ADD COLUMN IF NOT EXISTS total_tokens INTEGER',
-            'CREATE INDEX IF NOT EXISTS ix_search_history_user_id ON search_history(user_id)',
-            'CREATE INDEX IF NOT EXISTS ix_search_history_organization_id ON search_history(organization_id)',
-            'ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS user_id TEXT',
-            'ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS organization_id TEXT',
-            'CREATE INDEX IF NOT EXISTS ix_user_sessions_user_id ON user_sessions(user_id)',
-            'CREATE INDEX IF NOT EXISTS ix_user_sessions_organization_id ON user_sessions(organization_id)',
+            'ALTER TABLE aura_search_history ADD COLUMN IF NOT EXISTS user_id TEXT',
+            'ALTER TABLE aura_search_history ADD COLUMN IF NOT EXISTS organization_id TEXT',
+            'ALTER TABLE aura_search_history ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER',
+            'ALTER TABLE aura_search_history ADD COLUMN IF NOT EXISTS completion_tokens INTEGER',
+            'ALTER TABLE aura_search_history ADD COLUMN IF NOT EXISTS total_tokens INTEGER',
+            'CREATE INDEX IF NOT EXISTS ix_search_history_user_id ON aura_search_history(user_id)',
+            'CREATE INDEX IF NOT EXISTS ix_search_history_organization_id ON aura_search_history(organization_id)',
+            'ALTER TABLE aura_user_sessions ADD COLUMN IF NOT EXISTS user_id TEXT',
+            'ALTER TABLE aura_user_sessions ADD COLUMN IF NOT EXISTS organization_id TEXT',
+            'CREATE INDEX IF NOT EXISTS ix_user_sessions_user_id ON aura_user_sessions(user_id)',
+            'CREATE INDEX IF NOT EXISTS ix_user_sessions_organization_id ON aura_user_sessions(organization_id)',
         ]
         applied = []
         async with engine.begin() as conn:

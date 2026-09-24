@@ -28,7 +28,7 @@ from urllib.parse import quote
 import requests
 from pydantic import BaseModel, Field
 
-from agent.types import PlannedStep, RunContext, register_definition
+from agent.types import PlannedStep, RunContext, language_directive, register_definition
 from parser import extract_text
 from structured import generate_structured
 
@@ -184,7 +184,7 @@ class DocumentIntelligenceAgent:
             system = (
                 "You are a senior auditor triaging engagement documents. Classify and extract only from the provided "
                 "text; never invent a fact. Be concise."
-            )
+            ) + language_directive(ctx.language)
             batch = generate_structured(prompt, DocBatch, system=system, usage_out=ctx.usage_out)
             by_index = {c.index: c for c in batch.classifications}
 

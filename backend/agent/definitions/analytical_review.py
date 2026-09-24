@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from agent.types import PlannedStep, RunContext, register_definition
+from agent.types import PlannedStep, RunContext, language_directive, register_definition
 from agent.definitions.file_review import _extract_lines, _is_error  # shared, tolerant FS parser
 from structured import generate_structured
 
@@ -262,7 +262,7 @@ class AnalyticalReviewAgent:
             "You are a senior auditor performing analytical procedures. Use ONLY the figures provided (they were "
             "computed in code). Never compute, estimate, or invent a number. Give business-sensible explanations "
             "and concrete corroboration steps; be concise and specific."
-        )
+        ) + language_directive(ctx.language)
         draft = generate_structured(prompt, AnalyticalDraft, system=system, usage_out=ctx.usage_out)
 
         fnotes = {n.index: n for n in draft.fluctuation_notes}

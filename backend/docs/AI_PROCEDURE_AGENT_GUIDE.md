@@ -291,8 +291,8 @@ auditai side compacts it (`compact_prior_program`) and injects it into the promp
 | Store | What it holds |
 |---|---|
 | **Product DB (MySQL)** | The program **sections** themselves — active or soft-deleted. The only place procedure text lives. |
-| **AI DB (Postgres, `agent_runs` / `agent_steps`)** | Run bookkeeping: plan, status, `working_paper_id`, `is_template`, `dismissed`, and `result_summary` (sections created, undone flag, `undone_section_ids`). Powers history + undo/redo/delete. |
-| **AI DB (Postgres, `proc_memory`, pgvector)** | Per-org firm **style memory** (embeddings + source provenance). |
+| **AI DB (Postgres, `aura_agent_runs` / `aura_agent_steps`)** | Run bookkeeping: plan, status, `working_paper_id`, `is_template`, `dismissed`, and `result_summary` (sections created, undone flag, `undone_section_ids`). Powers history + undo/redo/delete. |
+| **AI DB (Postgres, `aura_proc_memory`, pgvector)** | Per-org firm **style memory** (embeddings + source provenance). |
 
 ---
 

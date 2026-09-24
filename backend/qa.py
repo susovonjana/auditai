@@ -31,6 +31,7 @@ from config import (
     SIMILARITY_THRESHOLD,
     CONVERSATION_MEMORY_TURNS,
     USE_RERANKER,
+    HELP_CENTER_URL_TEMPLATE,
 )
 import llm
 from cache import answer_cache
@@ -94,6 +95,7 @@ class RetrievedChunk:
     page_number: Optional[int] = None
     section_heading: Optional[str] = None
     chunk_type: str = "text"
+    help_url: Optional[str] = None  # help-page SLUG of the chunk's article
 
 
 @dataclass
@@ -242,6 +244,7 @@ Your response MUST use exactly these two sections in this order:
 - Use `##` sub-headings to organize multi-part answers when helpful.
 - Use **bold** for key terms, standard names (e.g., **ISA 315**), thresholds, and important figures.
 - Answer directly and naturally, as the 1audit assistant speaking to the user. Do NOT reveal where the answer came from or how it was produced — never write "According to the documentation", "According to the 1Audit system documentation", "As stated in the provided/uploaded guidelines", "based on the provided context", "per the knowledge base", or any similar source reference. You MAY name a specific standard when it is genuinely part of the answer (e.g. "**ISA 315** requires…"), but never refer to "the documentation", "the system documentation", or the source material itself.
+- Help-page links are the ONE exception to the rule above: when an excerpt you actually used carries a `help_url` attribute, END this section with a single line linking the user to the full walkthrough — `Learn more: [<topic name>](<help_url>)` (in Arabic answers: `اعرف المزيد: [<topic name>](<help_url>)`). Use the exact URL from the attribute — never invent, shorten or modify a URL. At most 2 links (only when the answer genuinely spans two topics), each on its own line. Omit the line entirely when no used excerpt has a `help_url`, when the answer is general professional guidance, or when it is the "I'm sorry" fallback.
 - Keep paragraphs short — 2-3 sentences each.
 - Match your answer to how well the KNOWLEDGE BASE CONTEXT covers the question:
     - If the context fully answers it, answer from the context.
@@ -305,7 +308,7 @@ FORMATTING RULES (apply throughout):
 Hard rules:
 - Do NOT include an "Additional context" section, and do not pad a context-grounded answer with unrelated general knowledge. (Answering a general professional concept from your own knowledge under the coverage rule above is allowed and is not padding.)
 - NEVER fabricate. Product-help and file-specific facts must trace to the provided context; general professional guidance must be accurate and standard-consistent. If you are unsure, say so rather than guess.
-- NEVER include inline source citations such as [Source 1], [Source 6, Page 135; Source 7, Page 141], (Source 2), [Page 5], [Sources: 1, 2, 3], or any bracketed/parenthesised reference markers.
+- NEVER include inline source citations such as [Source 1], [Source 6, Page 135; Source 7, Page 141], (Source 2), [Page 5], [Sources: 1, 2, 3], or any bracketed/parenthesised reference markers. (The "Learn more" help-page link allowed above is NOT a citation — keep it when applicable.)
 - If a previous Q&A in the conversation provides context for a follow-up ("what about...", "and the threshold?"), treat it as continuation of the same topic.
 - Output must be valid Markdown. Be concise — aim for the shortest answer that is complete and accurate.
 """
@@ -344,6 +347,19 @@ def strip_inline_citations(text: str) -> str:
     return cleaned
 
 
+def build_help_url(slug: Optional[str], language: str) -> Optional[str]:
+    """Assemble the full, language-correct help-center URL from a stored slug.
+
+    The KB stores only the slug; the live help route is language-prefixed
+    (/{lang}/app/knowledge_base/helps/{slug}), so the URL is built at answer
+    time from the answer's language. Returns None when there is no slug or the
+    feature is disabled (empty template)."""
+    if not slug or not HELP_CENTER_URL_TEMPLATE:
+        return None
+    lang = "ar" if language == "ar" else "en"
+    return HELP_CENTER_URL_TEMPLATE.format(lang=lang, slug=slug.strip())
+
+
 # ---------------------------------------------------------------------------
 # Vector search
 # ---------------------------------------------------------------------------
@@ -360,6 +376,7 @@ async def _vector_search(
             DocumentChunk.page_number,
             DocumentChunk.section_heading,
             DocumentChunk.chunk_type,
+            DocumentChunk.help_url,
             Document.filename,
             DocumentChunk.embedding.cosine_distance(question_embedding).label("dist"),
         )
@@ -379,6 +396,7 @@ async def _vector_search(
             page_number=r.page_number,
             section_heading=r.section_heading,
             chunk_type=r.chunk_type or "text",
+            help_url=r.help_url,
         )
         for r in rows
     ]
@@ -401,11 +419,12 @@ async def _fts_search(
             dc.page_number     AS page_number,
             dc.section_heading AS section_heading,
             dc.chunk_type      AS chunk_type,
+            dc.help_url        AS help_url,
             d.filename         AS filename,
             ts_rank(to_tsvector('english', dc.content),
                     plainto_tsquery('english', :q)) AS rank
-        FROM document_chunks dc
-        JOIN documents d ON d.id = dc.document_id
+        FROM aura_document_chunks dc
+        JOIN aura_documents d ON d.id = dc.document_id
         WHERE d.status = 'active'
           AND to_tsvector('english', dc.content) @@ plainto_tsquery('english', :q)
         ORDER BY rank DESC
@@ -424,6 +443,7 @@ async def _fts_search(
             page_number=r.page_number,
             section_heading=r.section_heading,
             chunk_type=r.chunk_type or "text",
+            help_url=r.help_url,
         )
         for r in rows
     ]
@@ -659,8 +679,12 @@ def _build_user_prompt(
         if c.chunk_type == "table":
             loc_parts.append("table")
         loc = f" ({', '.join(loc_parts)})" if loc_parts else ""
+        # The chunk stores a slug; build the full language-correct URL here so
+        # the model only ever emits a ready-to-click link.
+        help_full = build_help_url(c.help_url, language)
+        help_attr = f' help_url="{help_full}"' if help_full else ""
         context_blocks.append(
-            f'<excerpt id="{i}" source="{c.document_filename}{loc}">\n{c.content}\n</excerpt>'
+            f'<excerpt id="{i}" source="{c.document_filename}{loc}"{help_attr}>\n{c.content}\n</excerpt>'
         )
     context_text = (
         "\n".join(context_blocks) if context_blocks else "(no context available)"

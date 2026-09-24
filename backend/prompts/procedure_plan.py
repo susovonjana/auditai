@@ -132,6 +132,7 @@ def build_plan_prompt(
     secondary_language: Optional[str] = None,
     prior_program: Optional[Dict[str, Any]] = None,
     template_mode: bool = False,
+    reviewer_language: Optional[str] = None,
 ) -> str:
     """Assemble the USER prompt for the one-shot program draft (Phase 1).
 
@@ -150,9 +151,14 @@ def build_plan_prompt(
     engagement keys (risks/plan/materiality/area accounts) are OMITTED from
     DATA (absent, not null, so the model never reasons about "thin risk data")
     and the coverage rule becomes the full standard assertion set.
+
+    ``reviewer_language`` is the UI language of the auditor RUNNING the agent —
+    the checkpoint-only prose (config_summary + per-node rationale) is written
+    in it; the drafted CONTENT keeps the primary/secondary convention above.
     """
     lang_name = _LANG_NAME.get(language, "English")
     sl_name = _LANG_NAME.get(secondary_language, secondary_language) if secondary_language else None
+    reviewer_name = _LANG_NAME.get((reviewer_language or language or "en").lower(), "English")
     area = (working_paper_name or "").strip() or "this working paper's area"
 
     data = {
@@ -279,13 +285,16 @@ def build_plan_prompt(
             f"EVERY matching secondary field (title_sl, procedure_html_sl, placeholder_sl, "
             f"options_sl) with the SAME content professionally written in {sl_name} (same "
             f"HTML rules, same list structure; options_sl aligned 1:1 with options). Never "
-            f"leave a secondary field empty when its main field has content."
+            f"leave a secondary field empty when its main field has content. The auditor "
+            f"reviewing this draft works in {reviewer_name}: write the config_summary and "
+            f"every one-line rationale in {reviewer_name}."
         )
     else:
         language_note = (
             f"Write ALL auditor-facing text in {lang_name}. This file is single-language: "
             f"leave every *_sl field (title_sl, procedure_html_sl, placeholder_sl, "
-            f"options_sl) EMPTY."
+            f"options_sl) EMPTY. The auditor reviewing this draft works in {reviewer_name}: "
+            f"write the config_summary and every one-line rationale in {reviewer_name}."
         )
 
     opener = (

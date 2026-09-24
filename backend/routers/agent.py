@@ -424,6 +424,9 @@ async def approve_step(
         RunContext(
             copilot=ctx_copilot,
             audit_file_id=run.audit_file_id,
+            # post-approval synthesis writes the final report in the approving
+            # user's UI language
+            language=payload.language or "en",
             organization_id=run.organization_id,
             is_template=bool(run.is_template),
         ),
@@ -460,6 +463,8 @@ async def reject_step(
         RunContext(
             copilot=ctx_copilot,
             audit_file_id=run.audit_file_id,
+            # the rejection path also synthesizes the final report
+            language=payload.language or "en",
             organization_id=run.organization_id,
             is_template=bool(run.is_template),
         ),

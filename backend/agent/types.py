@@ -103,3 +103,23 @@ AGENT_DEFINITIONS: Dict[str, AgentDefinition] = {}
 
 def register_definition(definition: AgentDefinition) -> None:
     AGENT_DEFINITIONS[definition.agent_type] = definition
+
+
+_LANG_NAME = {"en": "English", "ar": "Arabic"}
+
+
+def language_directive(language: Optional[str]) -> str:
+    """System-prompt suffix pinning the LLM's prose to the RUNNING user's UI
+    language (ctx.language). Every agent that generates human-readable text —
+    findings, reasons, summaries, recommendations — appends this so an Arabic
+    user reads Arabic and an English user reads English, regardless of which
+    language dominates the file's data. Explicit for English too: Arabic-heavy
+    file data would otherwise pull the model into Arabic."""
+    name = _LANG_NAME.get((language or "en").lower(), "English")
+    return (
+        f"\n\nLANGUAGE: The auditor reading your output works in {name}. Write every "
+        f"human-readable text you produce — summaries, reasons, findings, notes, "
+        f"explanations, recommendations — in {name}. Do NOT translate identifiers, "
+        f"codes, statuses, or account/working-paper names quoted from the data; keep "
+        f"those exactly as they appear."
+    )

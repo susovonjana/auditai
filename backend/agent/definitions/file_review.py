@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from agent.types import PlannedStep, RunContext, register_definition
+from agent.types import PlannedStep, RunContext, language_directive, register_definition
 from structured import generate_structured
 
 
@@ -237,7 +237,7 @@ class FileReviewAgent:
             "estimate, or recompute a figure — the figures in computed_movements were calculated "
             "in code and are the only numbers you may report. If something is missing, list it "
             "under data_gaps rather than guessing. Be concise and specific."
-        )
+        ) + language_directive(ctx.language)
         report = generate_structured(
             prompt,
             NeedsAttentionReport,
