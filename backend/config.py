@@ -118,7 +118,7 @@ ONEAUDIT_HTTP_CONNECT_TIMEOUT: int = int(os.getenv("ONEAUDIT_HTTP_CONNECT_TIMEOU
 # domain) via env. Set to "" to disable Learn-more links entirely.
 HELP_CENTER_URL_TEMPLATE: str = os.getenv(
     "HELP_CENTER_URL_TEMPLATE",
-    "https://beta.1audit.com/{lang}/app/knowledge_base/helps/{slug}",
+    "https://1audit.com/{lang}/app/knowledge_base/helps/{slug}",
 )
 
 # Shared secret used by 1audit-be to SIGN copilot grants (HS256). When set here
@@ -391,8 +391,22 @@ DOC_READER_DOWNLOAD_TIMEOUT_SEC: int = int(os.getenv("DOC_READER_DOWNLOAD_TIMEOU
 # AGENT_RUN_TIMEOUT_SEC mid-step.
 DOC_READER_MAX_BATCH_DOCS: int = int(os.getenv("DOC_READER_MAX_BATCH_DOCS", "8"))
 DOC_READER_BATCH_TIME_BUDGET_SEC: int = int(os.getenv("DOC_READER_BATCH_TIME_BUDGET_SEC", "100"))
-# Output-token cap for the structured insight (line items + summary can be long).
-DOC_READER_MAX_OUTPUT_TOKENS: int = int(os.getenv("DOC_READER_MAX_OUTPUT_TOKENS", "6000"))
+# Output-token cap for the structured insight. Output tokens cost 5x input, so
+# the prompt keeps summaries tight and line items capped; the cap below fits a
+# normal reading, and a reading that still truncates is retried ONCE with the
+# larger cap (never a degraded result — just the rare long one costs more).
+DOC_READER_MAX_OUTPUT_TOKENS: int = int(os.getenv("DOC_READER_MAX_OUTPUT_TOKENS", "3500"))
+DOC_READER_MAX_OUTPUT_TOKENS_RETRY: int = int(os.getenv("DOC_READER_MAX_OUTPUT_TOKENS_RETRY", "6000"))
+# Long scanned PDFs: read the first pages AND the last N pages (totals,
+# signatures, schedules live at the end) instead of only the first MAX_PAGES.
+DOC_READER_TAIL_PAGES: int = int(os.getenv("DOC_READER_TAIL_PAGES", "4"))
+# Skip near-blank scanned pages (separator sheets, empty backs) — each page image
+# costs ~2,300 tokens whatever it shows.
+DOC_READER_SKIP_BLANK_PAGES: bool = os.getenv("DOC_READER_SKIP_BLANK_PAGES", "true").lower() == "true"
+# OPT-IN cost lever: route short text-only documents (no page images, at most
+# this many extracted characters) to the "fast" model tier (~1/3 of the price).
+# 0 = off (default): every document is read by the smart tier.
+DOC_READER_FAST_TIER_MAX_CHARS: int = int(os.getenv("DOC_READER_FAST_TIER_MAX_CHARS", "0"))
 # Follow-up Q&A over one document: how much of the stored text is handed to the model.
 DOC_READER_ASK_CONTEXT_CHARS: int = int(os.getenv("DOC_READER_ASK_CONTEXT_CHARS", "40000"))
 # DEV ONLY — path of a local file the reader uses INSTEAD of downloading the

@@ -315,6 +315,20 @@ def complete_text(
 _STRUCTURED_TOOL_NAME = "emit"
 
 
+def _structured_tool(schema: Type[BaseModel]) -> dict:
+    """The forced-tool definition for a schema. Marked as a prompt-cache
+    breakpoint: a schema is static across requests (the document reader's is
+    ~1.5k tokens) and tools are the first part of the cached prefix, so repeat
+    reads within the cache window pay ~10% for it — and for the system prompt
+    cached right after it."""
+    return {
+        "name": _STRUCTURED_TOOL_NAME,
+        "description": "Return the result as structured data matching the schema.",
+        "input_schema": schema.model_json_schema(),
+        "cache_control": {"type": "ephemeral"},
+    }
+
+
 def complete_structured(
     system: Optional[str],
     prompt: str,
@@ -327,11 +341,7 @@ def complete_structured(
     """Force the model to call a single tool whose input_schema is ``schema``,
     then validate the tool input into the Pydantic object. This is the robust
     Bedrock equivalent of Gemini's constrained JSON decoding."""
-    tool = {
-        "name": _STRUCTURED_TOOL_NAME,
-        "description": "Return the result as structured data matching the schema.",
-        "input_schema": schema.model_json_schema(),
-    }
+    tool = _structured_tool(schema)
     resp, model = _messages_create(
         tier=tier,
         system=system or None,
@@ -373,11 +383,7 @@ def complete_structured_blocks(
       {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "<b64>"}}
       {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "<b64>"}}
     The structured JSON is still obtained via forced tool-use on ``schema``."""
-    tool = {
-        "name": _STRUCTURED_TOOL_NAME,
-        "description": "Return the result as structured data matching the schema.",
-        "input_schema": schema.model_json_schema(),
-    }
+    tool = _structured_tool(schema)
     resp, model = _messages_create(
         tier=tier,
         system=system or None,

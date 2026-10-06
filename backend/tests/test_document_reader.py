@@ -74,6 +74,7 @@ def test_extract_pdf_native_text_pages():
 
 def test_extract_pdf_scanned_pages_rendered_for_vision(monkeypatch):
     monkeypatch.setattr(config, "DOC_READER_VISION_ENABLED", True)
+    monkeypatch.setattr(config, "DOC_READER_SKIP_BLANK_PAGES", False)  # synthetic pages are blank
     data = _pdf_with_text(["", ""])  # no text layer → "scanned"
     out = dr.extract_content(data, "scan.pdf", "application/pdf")
     assert out.read_method == "vision"
@@ -83,12 +84,83 @@ def test_extract_pdf_scanned_pages_rendered_for_vision(monkeypatch):
     assert any("scanned" in n for n in out.notes)
 
 
-def test_extract_pdf_page_cap(monkeypatch):
-    monkeypatch.setattr(config, "DOC_READER_MAX_PAGES", 2)
-    data = _pdf_with_text(["one " * 20, "two " * 20, "three " * 20])
+def test_extract_pdf_page_cap_reads_head_and_tail(monkeypatch):
+    monkeypatch.setattr(config, "DOC_READER_MAX_PAGES", 3)
+    monkeypatch.setattr(config, "DOC_READER_TAIL_PAGES", 1)
+    data = _pdf_with_text([f"page{i} " * 20 for i in range(1, 7)])  # 6 pages
     out = dr.extract_content(data, "long.pdf", "application/pdf")
-    assert out.pages == 2 and out.truncated is True
-    assert "[Page 3]" not in out.text
+    assert out.pages == 3 and out.truncated is True
+    assert "[Page 1]" in out.text and "[Page 2]" in out.text and "[Page 6]" in out.text  # last page kept
+    assert "[Page 3]" not in out.text and "[Page 5]" not in out.text
+    assert any("middle was skipped" in n for n in out.notes)
+
+
+def test_select_pages_policy():
+    assert dr.select_pages(5, 20, 4) == [0, 1, 2, 3, 4]
+    assert dr.select_pages(50, 20, 4) == list(range(16)) + [46, 47, 48, 49]
+    assert dr.select_pages(50, 20, 0) == list(range(20))
+    assert dr.select_pages(0, 20, 4) == []
+
+
+def test_blank_scanned_pages_are_skipped(monkeypatch):
+    monkeypatch.setattr(config, "DOC_READER_VISION_ENABLED", True)
+    monkeypatch.setattr(config, "DOC_READER_SKIP_BLANK_PAGES", True)
+    import fitz
+    from PIL import Image, ImageDraw
+    doc = fitz.open()
+    doc.new_page()  # blank scanned page (no text, nothing drawn)
+    img = Image.new("RGB", (600, 800), "white"); d = ImageDraw.Draw(img)
+    for y in range(40, 760, 24):
+        d.text((40, y), "SCANNED INVOICE LINE " * 3, fill="black")
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    p2 = doc.new_page(); p2.insert_image(p2.rect, stream=buf.getvalue())
+    data = doc.tobytes(); doc.close()
+    out = dr.extract_content(data, "scan.pdf", "application/pdf")
+    assert len(out.images) == 1 and out.images[0]["page"] == 2
+    assert any("blank page" in n for n in out.notes)
+
+
+def test_analyze_retries_once_when_output_truncated(monkeypatch):
+    calls = []
+
+    def fake_generate(blocks, schema, *, system=None, tier="smart", max_output_tokens=0, usage_out=None, **_):
+        calls.append((tier, max_output_tokens))
+        if usage_out is not None:
+            usage_out.update(input=100, output=50, model="m")
+        if len(calls) == 1:
+            raise RuntimeError("Bedrock returned no structured tool_use output (possibly truncated by max_tokens)")
+        return schema(doc_type="invoice", title="t", summary_short="s", summary="s")
+
+    monkeypatch.setattr(dr, "generate_structured_from_blocks", fake_generate)
+    monkeypatch.setattr(config, "DOC_READER_MAX_OUTPUT_TOKENS", 3500)
+    monkeypatch.setattr(config, "DOC_READER_MAX_OUTPUT_TOKENS_RETRY", 6000)
+    monkeypatch.setattr(config, "DOC_READER_FAST_TIER_MAX_CHARS", 0)
+    usage = {}
+    ex = dr.ExtractedContent(text="x" * 100, chars=100, pages=1, read_method="native_text")
+    out = dr.analyze_document(ex, name="a.pdf", mime_type="application/pdf", usage_out=usage)
+    assert out.doc_type == "invoice"
+    assert calls == [("smart", 3500), ("smart", 6000)]
+    assert usage == {"input": 200, "output": 100, "model": "m"}  # both attempts billed
+
+
+def test_fast_tier_opt_in(monkeypatch):
+    seen = {}
+
+    def fake_generate(blocks, schema, *, tier="smart", **kw):
+        seen["tier"] = tier
+        return schema(doc_type="receipt", title="t", summary_short="s", summary="s")
+
+    monkeypatch.setattr(dr, "generate_structured_from_blocks", fake_generate)
+    short_text = dr.ExtractedContent(text="x" * 500, chars=500, pages=1, read_method="native_text")
+    monkeypatch.setattr(config, "DOC_READER_FAST_TIER_MAX_CHARS", 0)
+    dr.analyze_document(short_text, name="r.pdf", mime_type="application/pdf")
+    assert seen["tier"] == "smart"  # off by default
+    monkeypatch.setattr(config, "DOC_READER_FAST_TIER_MAX_CHARS", 8000)
+    dr.analyze_document(short_text, name="r.pdf", mime_type="application/pdf")
+    assert seen["tier"] == "fast"
+    scan = dr.ExtractedContent(text="", images=[{"media_type": "image/jpeg", "data": "AA==", "page": 1}], chars=0, pages=1, read_method="vision")
+    dr.analyze_document(scan, name="s.png", mime_type="image/png")
+    assert seen["tier"] == "smart"  # scans never downgrade
 
 
 def test_extract_image_downscales_and_encodes(monkeypatch):
@@ -233,6 +305,7 @@ def test_build_insight_pipeline(monkeypatch):
 
 def test_build_insight_vision_blocks_order(monkeypatch):
     monkeypatch.setattr(config, "DOC_READER_VISION_ENABLED", True)
+    monkeypatch.setattr(config, "DOC_READER_SKIP_BLANK_PAGES", False)  # synthetic page is blank
     meta = {"document_id": 1, "reference": "D-1", "name": "scan.pdf", "mime_type": "application/pdf",
             "size": 1, "updated_at": "x", "download_url": "u"}
     monkeypatch.setattr(dr, "download_document", lambda m, ctx=None: _pdf_with_text([""]))

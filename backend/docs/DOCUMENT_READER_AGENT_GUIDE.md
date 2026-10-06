@@ -101,7 +101,24 @@ store    aura_document_insights (insight JSON + extracted text + content_key), p
 | Selected-documents loop (list) | one document per request, sequential | per-row progress, cancel any time; only what the auditor ticked |
 | Batch agent (hidden) | selection required; 8 docs / 100 s per run | stays inside the agent runtime's 120 s step budget; re-run continues |
 
-Every call is metered to the org ledger under feature `document_reader` and blocked at 402 when the org is over its monthly AI credits. Cached readings cost nothing.
+Every call is metered to the org ledger under feature `document_reader` and blocked at 402 when the org is over its monthly AI credits. Cached readings cost nothing. The panel shows the credits each reading used.
+
+### Token economics and what keeps them low
+One reading = fixed prompt (~700 tokens system + ~1,460 tokens schema + context) + the document (text pages ≈ 500–900 tokens each; scanned pages ≈ 2,300 tokens each at 1568 px) + the structured output (≈ 1,000–2,000 tokens; output costs 5x input). Measures in place, none of which changes the result quality:
+
+| Measure | Effect |
+|---|---|
+| Reading cache per document + language | re-opening costs 0 |
+| Prompt caching on the schema tool + system prompt | the ~2,100 fixed tokens cost ~10% on repeat reads within the cache window |
+| Type-aware output rules | transactional documents (invoice, receipt, PO, statement…) get a 2–4 sentence summary and no prose repetition of the structured fields; contracts/reports keep 5–10 sentences; line items ≤ 30, key facts ≤ 8 |
+| Output cap 3,500 with one automatic retry at 6,000 | the rare long reading still completes; everything else never over-allocates |
+| Text pages are never rendered | native text is 3–4x cheaper than a page image |
+| Blank scanned pages skipped | separator sheets / empty backs cost nothing |
+| Long scans: first pages + last 4 pages | same cost as "first 20", but the totals and signatures at the end are read |
+| Follow-up questions: cached document context | repeat questions about the same document pay ~10% for the context block |
+| `DOC_READER_FAST_TIER_MAX_CHARS` (opt-in, off) | short text-only documents on the Haiku tier (~1/3 price) — enable per environment after checking quality on your documents |
+
+Measured on the synthetic one-page invoice image (2 line items): output 1,217 → 1,050 tokens after the output rules (−14%); the saving grows with the number of line items and the length of the prose. Input is unchanged for a first read; repeat reads within the cache window pay ~10% for the fixed ~2,100-token prefix.
 
 ---
 

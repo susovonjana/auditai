@@ -104,14 +104,14 @@ class DocumentInsight(BaseModel):
     title: str = Field(description="a human title for the document, e.g. 'Tax invoice INV-2026-0142 from Al Noor Trading'")
     language_detected: Optional[str] = Field(default=None, description="ar / en / ar+en / other")
     summary_short: str = Field(description="1–2 sentences for the document list")
-    summary: str = Field(description="the full summary, 4–10 concise bullet-style sentences separated by newlines")
+    summary: str = Field(description="concise bullet-style sentences separated by newlines: 2–4 for transactional documents (invoice, receipt, PO, statement…) without repeating the structured fields; 5–10 on the substance for contracts, reports, minutes, letters")
     parties: List[Party] = Field(default_factory=list)
     dates: List[DatedItem] = Field(default_factory=list)
     amounts: List[Amount] = Field(default_factory=list, description="totals and key figures; NOT every line (those go in line_items)")
     currency: Optional[str] = Field(default=None, description="the document's main currency, as printed")
-    line_items: List[LineItem] = Field(default_factory=list, description="itemised rows if the document has them (max 60)")
+    line_items: List[LineItem] = Field(default_factory=list, description="itemised rows if the document has them — at most 30 (the most material ones when there are more; state the total row count in key_facts)")
     references: List[Reference] = Field(default_factory=list)
-    key_facts: List[str] = Field(default_factory=list, description="other important facts/terms not captured above (payment terms, warranty, approvals, signatures, stamps, period covered …)")
+    key_facts: List[str] = Field(default_factory=list, description="at most 8 facts the structured fields cannot hold (payment terms, warranty, approvals, signatures, stamps, special conditions, discrepancies) — never restate amounts, parties or dates")
     audit_relevance: AuditRelevance = Field(default_factory=AuditRelevance)
     red_flags: List[str] = Field(default_factory=list)
     data_gaps: List[str] = Field(default_factory=list, description="what could not be read / is missing from the document")
@@ -317,6 +317,35 @@ def _sample_text(text: str, limit: int) -> Tuple[str, bool]:
     )
 
 
+def select_pages(total: int, max_pages: int, tail: int) -> List[int]:
+    """0-based page indices to read. Within the cap: all pages. Over it: the first
+    ``max_pages - tail`` pages plus the LAST ``tail`` pages — the end of a long
+    document carries totals, signatures and schedules, so reading only the head
+    would miss exactly what an auditor checks. Same token cost as the old
+    first-N policy."""
+    total = max(0, int(total))
+    max_pages = max(1, int(max_pages))
+    if total <= max_pages:
+        return list(range(total))
+    tail = max(0, min(int(tail), max_pages - 1))
+    head = max_pages - tail
+    return list(range(head)) + list(range(total - tail, total))
+
+
+def is_blank_image(pil_img, *, white_threshold: int = 235, std_threshold: float = 6.0) -> bool:
+    """True for a (near-)uniform page — an empty back, a separator sheet, a
+    failed scan. Cheap: grayscale mean + standard deviation on a downscaled copy."""
+    try:
+        from PIL import ImageStat
+        g = pil_img.convert("L")
+        g.thumbnail((256, 256))
+        st = ImageStat.Stat(g)
+        mean, std = float(st.mean[0]), float(st.stddev[0])
+        return std < std_threshold and (mean > white_threshold or mean < 255 - white_threshold)
+    except Exception:
+        return False
+
+
 def _extract_pdf(data: bytes, out: ExtractedContent) -> None:
     try:
         import fitz  # PyMuPDF
@@ -336,11 +365,17 @@ def _extract_pdf(data: bytes, out: ExtractedContent) -> None:
         if doc.needs_pass:
             raise DocumentReaderError("The PDF is password-protected and cannot be read.")
         total = doc.page_count
-        out.pages = min(total, max_pages)
+        page_indices = select_pages(total, max_pages, int(config.DOC_READER_TAIL_PAGES))
+        out.pages = len(page_indices)
         if total > max_pages:
-            out.notes.append(f"only the first {max_pages} of {total} pages were read")
+            first_block = [i for i in page_indices if i < page_indices[-1] - int(config.DOC_READER_TAIL_PAGES)]
+            out.notes.append(
+                f"{total} pages: read pages 1–{len(first_block)} and the last "
+                f"{len(page_indices) - len(first_block)}; the middle was skipped (page cap {max_pages})"
+            )
             out.truncated = True
-        for i in range(out.pages):
+        blank_skipped: List[int] = []
+        for i in page_indices:
             page = doc[i]
             try:
                 txt = (page.get_text("text") or "").strip()
@@ -360,11 +395,16 @@ def _extract_pdf(data: bytes, out: ExtractedContent) -> None:
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
                 from PIL import Image
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
+                if config.DOC_READER_SKIP_BLANK_PAGES and is_blank_image(img):
+                    blank_skipped.append(i + 1)  # a separator sheet costs ~2k tokens for nothing
+                    continue
                 media, b64 = _encode_image(img, int(config.DOC_READER_MAX_IMAGE_EDGE))
                 out.images.append({"media_type": media, "data": b64, "page": i + 1})
             except Exception as exc:  # a bad page never kills the whole read
                 logger.warning("document_reader: page %d render failed: %s", i + 1, exc)
                 out.notes.append(f"page {i + 1} could not be rendered")
+        if blank_skipped:
+            out.notes.append(f"{len(blank_skipped)} blank page(s) skipped: {blank_skipped[:10]}")
     finally:
         try:
             doc.close()
@@ -551,13 +591,38 @@ def analyze_document(
     from agent.types import language_directive  # prose language = the reader's UI language
 
     system = prompts.SYSTEM_PROMPT + language_directive(language)
-    return generate_structured_from_blocks(
-        blocks,
-        DocumentInsight,
-        system=system,
-        max_output_tokens=int(config.DOC_READER_MAX_OUTPUT_TOKENS),
-        usage_out=usage_out,
-    )
+    # Opt-in cost lever (off by default): short, text-only documents can go to
+    # the fast tier. Scans/photos and long documents always use the smart tier.
+    tier = "smart"
+    fast_max = int(config.DOC_READER_FAST_TIER_MAX_CHARS or 0)
+    if fast_max > 0 and not extracted.images and 0 < extracted.chars <= fast_max:
+        tier = "fast"
+    try:
+        return generate_structured_from_blocks(
+            blocks, DocumentInsight, system=system, tier=tier,
+            max_output_tokens=int(config.DOC_READER_MAX_OUTPUT_TOKENS), usage_out=usage_out,
+        )
+    except RuntimeError as exc:
+        # The forced tool output was cut by max_tokens (a very long itemised
+        # document). Retry once with the larger cap so the result is never
+        # degraded — only the rare long reading pays for it.
+        if "truncated" not in str(exc).lower() and "no structured" not in str(exc).lower():
+            raise
+        logger.info("document_reader: structured output truncated at %s tokens — retrying with %s",
+                    config.DOC_READER_MAX_OUTPUT_TOKENS, config.DOC_READER_MAX_OUTPUT_TOKENS_RETRY)
+        first_usage = dict(usage_out or {})
+        retry_usage: dict = {}
+        result = generate_structured_from_blocks(
+            blocks, DocumentInsight, system=system, tier=tier,
+            max_output_tokens=int(config.DOC_READER_MAX_OUTPUT_TOKENS_RETRY), usage_out=retry_usage,
+        )
+        if usage_out is not None:  # bill both attempts
+            usage_out.update(
+                input=int(first_usage.get("input", 0) or 0) + int(retry_usage.get("input", 0) or 0),
+                output=int(first_usage.get("output", 0) or 0) + int(retry_usage.get("output", 0) or 0),
+                model=retry_usage.get("model") or first_usage.get("model") or "",
+            )
+        return result
 
 
 # ---------------------------------------------------------------------------

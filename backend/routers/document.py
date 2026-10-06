@@ -236,8 +236,11 @@ async def document_insight(
                     "summary_short": result["insight"].get("summary_short"), "insight": result["insight"],
                     "read_method": result.get("read_method"), "pages": result.get("pages"),
                 }
+            # cost transparency: tokens + credits this read spent (0 for a cache hit)
+            tokens = {"input": int(usage.get("input", 0) or 0), "output": int(usage.get("output", 0) or 0)}
+            credits = usage_meter.credits_for("smart", tokens["input"], tokens["output"]) if usage else 0
             yield _ev({"type": "result", "cached": False, "stale": False,
-                       "document": result["document"], **payload_out})
+                       "document": result["document"], "tokens": tokens, "credits": credits, **payload_out})
         finally:
             if usage:
                 try:
@@ -278,11 +281,23 @@ async def document_ask(
     req_id = uuid.uuid4().hex
     system = prompts.ASK_SYSTEM_PROMPT
     text_excerpt = (row.extracted_text or "")[: int(config.DOC_READER_ASK_CONTEXT_CHARS)]
-    prompt = prompts.build_ask_prompt(
-        question=payload.question, name=row.document_name, insight=row.insight or {},
-        text_excerpt=text_excerpt, language=payload.language,
-        history=[t.model_dump() for t in payload.history],
-    )
+    # Two content blocks: the document context (identical for every question about
+    # this document) carries a prompt-cache breakpoint, so follow-up questions in
+    # the cache window pay ~10% for the bulk of the request; the question follows.
+    prompt = [
+        {
+            "type": "text",
+            "text": prompts.build_ask_context(name=row.document_name, insight=row.insight or {}, text_excerpt=text_excerpt),
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": prompts.build_ask_question(
+                question=payload.question, language=payload.language,
+                history=[t.model_dump() for t in payload.history],
+            ),
+        },
+    ]
 
     async def stream():
         usage: dict = {}

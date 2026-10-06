@@ -55,10 +55,22 @@ SYSTEM_PROMPT = (
     "plain numbers (no thousands separators); put the currency code/symbol in `currency`.\n"
     "3. Classify `doc_type` from the taxonomy; use 'other' with a clear `title` when none fits.\n"
     "4. `summary_short` is ONE or TWO sentences an auditor can read in the document list. "
-    "`summary` is the full picture in 4–10 bullet-style sentences: purpose, parties, period, "
-    "key figures, terms/conditions, signatures/approvals, anything unusual. For a long report "
-    "or contract, summarise the substance (obligations, amounts, dates, termination, "
-    "penalties) — not the layout.\n"
+    "`summary` depends on the kind of document:\n"
+    "   - TRANSACTIONAL documents (invoice, credit note, receipt, purchase order, quotation, "
+    "delivery note, cheque, payslip, bank statement, voucher): 2–4 sentences — purpose, who "
+    "and whom, period/date, the headline amount and anything unusual. Do NOT repeat in prose "
+    "what the structured fields already carry (amounts, VAT, line items, VAT/CR numbers, "
+    "dates, reference numbers); those fields ARE the detail.\n"
+    "   - CONTRACTS, agreements, reports, minutes, letters, policies, statements: 5–10 "
+    "sentences on the substance — obligations, amounts, dates, term, termination, penalties, "
+    "decisions — not the layout. `line_items` stays empty.\n"
+    "   `key_facts` holds ONLY facts the structured fields cannot hold (payment terms, "
+    "warranty, approvals, stamps, discrepancies, special conditions), at most 8, no "
+    "restatement of amounts or parties.\n"
+    "   Size caps (output is expensive): line_items ≤ 30 rows — when a document has more, "
+    "give the 30 most material rows and state the total row count in key_facts; parties ≤ 6; "
+    "dates ≤ 10; references ≤ 10; red_flags ≤ 8; data_gaps ≤ 5. One line per item, no "
+    "filler, never repeat the document type in every field.\n"
     "5. `audit_relevance`: say which audit area(s) and financial-statement assertions this "
     "document can support as evidence (e.g. invoice → revenue/receivables: occurrence, "
     "accuracy, cut-off), its evidence quality (original/copy/scan/unsigned/system-generated), "
@@ -149,6 +161,46 @@ ASK_SYSTEM_PROMPT = (
 )
 
 
+def build_ask_context(
+    *,
+    name: Optional[str],
+    insight: Optional[Dict[str, Any]],
+    text_excerpt: str,
+) -> str:
+    """The STATIC part of a follow-up question: the document's reading + text.
+    Identical for every question about the same document, so the route marks it
+    as a prompt-cache breakpoint — repeat questions within the cache window pay
+    ~10% for it (the bulk of a Q&A request)."""
+    insight_json = json.dumps(insight or {}, ensure_ascii=False, default=str)[:12000]
+    return (
+        f"DOCUMENT: {name or 'document'}\n\n"
+        f"STRUCTURED READING (JSON):\n{insight_json}\n\n"
+        f"DOCUMENT TEXT (may be partial):\n<document_text>\n{text_excerpt}\n</document_text>"
+    )
+
+
+def build_ask_question(
+    *,
+    question: str,
+    language: str = "en",
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """The DYNAMIC part: earlier turns + the question (follows the cached context)."""
+    lang = _lang(language)
+    hist_lines: List[str] = []
+    for turn in (history or [])[-6:]:
+        role = (turn.get("role") or "").strip().lower()
+        content = (turn.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            hist_lines.append(f"{'Auditor' if role == 'user' else 'Assistant'}: {content[:1500]}")
+    hist = ("EARLIER TURNS:\n" + "\n".join(hist_lines) + "\n\n") if hist_lines else ""
+    return (
+        f"{hist}"
+        f"QUESTION: {question.strip()}\n\n"
+        f"Answer in {lang}, grounded only in the document above."
+    )
+
+
 def build_ask_prompt(
     *,
     question: str,
@@ -158,20 +210,10 @@ def build_ask_prompt(
     language: str = "en",
     history: Optional[List[Dict[str, str]]] = None,
 ) -> str:
-    lang = _lang(language)
-    hist_lines: List[str] = []
-    for turn in (history or [])[-6:]:
-        role = (turn.get("role") or "").strip().lower()
-        content = (turn.get("content") or "").strip()
-        if role in ("user", "assistant") and content:
-            hist_lines.append(f"{'Auditor' if role == 'user' else 'Assistant'}: {content[:1500]}")
-    hist = ("\nEARLIER TURNS:\n" + "\n".join(hist_lines) + "\n") if hist_lines else ""
-    insight_json = json.dumps(insight or {}, ensure_ascii=False, default=str)[:12000]
+    """Single-string form (context + question) kept for callers/tests that do
+    not use content blocks."""
     return (
-        f"DOCUMENT: {name or 'document'}\n\n"
-        f"STRUCTURED READING (JSON):\n{insight_json}\n\n"
-        f"DOCUMENT TEXT (may be partial):\n<document_text>\n{text_excerpt}\n</document_text>\n"
-        f"{hist}\n"
-        f"QUESTION: {question.strip()}\n\n"
-        f"Answer in {lang}, grounded only in the document above."
+        build_ask_context(name=name, insight=insight, text_excerpt=text_excerpt)
+        + "\n\n"
+        + build_ask_question(question=question, language=language, history=history)
     )
