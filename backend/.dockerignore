@@ -8,10 +8,13 @@ Dockerfile
 .dockerignore
 docker-compose*.yml
 
-# Secrets — task definition / Secrets Manager injects these at runtime
+# Secrets — the ECS task definition injects these at runtime via
+# `environmentFiles` (s3://env-file-ecs-application/…). NOTHING matching .env*
+# may reach the image: config.py does load_dotenv(override=True), so a baked
+# .env.production silently overrides every value ECS injected.
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Local Python virtualenv (~1.4 GB) — image installs its own
 .venv

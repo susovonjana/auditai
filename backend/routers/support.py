@@ -209,6 +209,16 @@ async def support_assist(
     # translation of the agent's own text needs none.
     chunks: List["qa.RetrievedChunk"] = []
     retrieval = "skipped"
+    # A polish — a draft with no instruction — may not add facts (system prompt),
+    # so reference material cannot be used in it: drop the support articles
+    # rather than pay for them. A draft WITH an instruction ("add the export
+    # steps") keeps them.
+    if mode == "write" and draft and not instruction and not translate:
+        kb_articles = []
+        # Likewise the thread: a polish keeps the draft's meaning, so the only
+        # context it can use is the message being answered (names, tone).
+        latest_customer = next((m for m in reversed(conversation) if m.get("role") == "customer"), None)
+        conversation = [latest_customer] if latest_customer else []
     needs_retrieval = payload.help_manual and (mode == "ask" or (not translate and not draft))
     if needs_retrieval:
         if mode == "ask":

@@ -559,7 +559,7 @@ async def _rerank_chunks(
 async def _safe_fts_search(
     db: AsyncSession, question: str, limit: int
 ) -> List[RetrievedChunk]:
-    """Wrapper that swallows errors so asyncio.gather can run alongside vector."""
+    """Wrapper that swallows errors so a failed FTS lookup still leaves the vector results usable."""
     try:
         return await _fts_search(db, question, limit)
     except Exception as exc:
@@ -587,15 +587,20 @@ async def retrieve_chunks(
     else:
         embeddings = [question_embedding]
 
-    # Fan out: one vector + one FTS search per query, all in parallel.
-    # 8 in flight (4 queries × 2) is well within the pool budget (30).
-    vec_tasks = [
-        _vector_search(db, emb, INITIAL_CANDIDATES) for emb in embeddings
-    ]
-    fts_tasks = [
-        _safe_fts_search(db, q, INITIAL_CANDIDATES) for q in queries
-    ]
-    ranked_lists = await asyncio.gather(*vec_tasks, *fts_tasks)
+    # One vector + one FTS search per query, run ONE AT A TIME on the caller's
+    # session. They used to be fanned out with asyncio.gather on this same
+    # session, but an AsyncSession cannot run queries concurrently: the FTS
+    # calls failed with "This session is provisioning a new connection;
+    # concurrent operations are not permitted" (swallowed below), the session
+    # was left half-bound, and its close() then raised — so the support desk's
+    # "Ask help manual" reported the manual as unavailable on every question,
+    # and each failure leaked a pooled connection. Parallelism would need a
+    # session per search; the serial cost here is a few short round-trips.
+    ranked_lists: List[List[RetrievedChunk]] = []
+    for emb in embeddings:
+        ranked_lists.append(await _vector_search(db, emb, INITIAL_CANDIDATES))
+    for q in queries:
+        ranked_lists.append(await _safe_fts_search(db, q, INITIAL_CANDIDATES))
 
     # Weight vector lists 2× over FTS — semantic match is more reliable than
     # keyword overlap on natural-language audit questions.

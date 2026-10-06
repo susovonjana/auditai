@@ -165,6 +165,7 @@ allowed_origins = [
     "http://localhost:3000",
     "http://localhost:3002",       # 1audit dev port
     "http://127.0.0.1:3002",
+    "https://1audit.com",
     "https://beta.1audit.com",
     "https://dev.1audit.com"
 ]

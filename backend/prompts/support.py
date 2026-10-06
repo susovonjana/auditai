@@ -35,14 +35,47 @@ from urllib.parse import urlparse
 
 _LANG_NAME = {"en": "English", "ar": "Arabic"}
 
-# Prompt-size guards. The conversation is the only open-ended part; the rest is
-# capped by the request schema.
+# Prompt-size guards.
+#
+# Every section has its own budget and the prompt is FITTED, never sliced: the
+# part the model must act on (the question, or the draft + instruction, and the
+# closing line) is always sent whole, and the context blocks give way in a
+# fixed order — knowledge first, then the oldest messages, then the ticket
+# description. The old single `prompt[:_MAX_PROMPT_CHARS]` cut from the end, so
+# on a long ticket the knowledge block overran the cap and the draft, the
+# agent's instruction and the closing line were silently dropped.
 _MAX_PROMPT_CHARS = 14000
-_MAX_CONVERSATION_CHARS = 6000
-_MAX_MESSAGE_CHARS = 1200
 _MAX_DESCRIPTION_CHARS = 2000
-_MAX_EXCERPT_CHARS = 1800
-_MAX_ARTICLE_CHARS = 1500
+
+# Conversation. A reply answers the customer's latest message, so that message,
+# the newest two messages and the agent's last reply are sent in full; older
+# messages are trimmed to their opening lines — enough to know what was already
+# said and tried, at a quarter of the tokens. Newest messages win the budget.
+_MAX_MESSAGE_CHARS = 1200
+_MAX_OLDER_MESSAGE_CHARS = 320
+_RECENT_MESSAGES_IN_FULL = 2
+# The budget is for the whole block; the must-keep messages are always sent
+# (at most four), older trimmed ones fill what is left, newest first.
+_CONVERSATION_CHARS_WRITE = 5000   # write / auto reply (was a flat 6000, every message in full)
+_CONVERSATION_CHARS_ASK = 3000     # ask: the question is explicit, the thread only disambiguates
+
+# Knowledge. Ask mode answers FROM the manual, so it keeps the wide window; a
+# reply needs the relevant steps and the link, so excerpts are shorter. Manual
+# chunks average under 100 characters, so these caps rarely bite — they bound
+# the rare very long chunk and the support articles, not the common case.
+# Excerpts come first (reranked, help-manual pages ahead), then the support
+# articles, until the total budget is spent; an item that does not fit is left
+# out whole rather than cut mid-sentence.
+_KNOWLEDGE_ASK = {
+    "max_excerpts": 6, "excerpt_chars": 1800,
+    "max_articles": 3, "article_chars": 1500,
+    "total_chars": 9500, "min_chars": 3000,
+}
+_KNOWLEDGE_WRITE = {
+    "max_excerpts": 6, "excerpt_chars": 1200,
+    "max_articles": 3, "article_chars": 1500,
+    "total_chars": 6500, "min_chars": 1500,
+}
 
 # The exact opener the model must use when the manual does not cover a
 # question. was_answered() keys off it, so keep both in sync.
@@ -263,25 +296,53 @@ def _ticket_block(ticket: dict) -> str:
     return f"<ticket>\n{body}\n</ticket>"
 
 
-def _conversation_block(conversation: Iterable[dict]) -> str:
-    """Newest messages win the budget; output stays oldest-first."""
+def _conversation_block(conversation: Iterable[dict], *, budget: int = _CONVERSATION_CHARS_WRITE) -> str:
+    """Newest messages win the budget; output stays oldest-first.
+
+    Sent in full (up to _MAX_MESSAGE_CHARS): the newest _RECENT_MESSAGES_IN_FULL
+    messages, the customer's latest message wherever it sits, and the agent's
+    last reply before it. Everything older is trimmed to its first
+    _MAX_OLDER_MESSAGE_CHARS characters. Timestamps are reduced to the date: the
+    model has no use for seconds, and a thread of twenty messages spent a line
+    of tokens on them.
+    """
+    messages = [m for m in conversation if _clean(m.get("text"))]
+    newest_first = list(reversed(messages))
+    full: set = set(range(min(_RECENT_MESSAGES_IN_FULL, len(newest_first))))
+    latest_customer = next((i for i, m in enumerate(newest_first) if m.get("role") == "customer"), None)
+    if latest_customer is not None:
+        full.add(latest_customer)
+        last_agent_before = next(
+            (i for i, m in enumerate(newest_first) if i > latest_customer and m.get("role") != "customer"),
+            None,
+        )
+        if last_agent_before is not None:
+            full.add(last_agent_before)
+
     kept: List[str] = []
     used = 0
-    for message in reversed(list(conversation)):
-        text = _clip(message.get("text"), _MAX_MESSAGE_CHARS)
-        if not text:
+    over = False
+    for i, message in enumerate(newest_first):
+        is_full = i in full
+        if over and not is_full:
             continue
+        limit = _MAX_MESSAGE_CHARS if is_full else _MAX_OLDER_MESSAGE_CHARS
+        text = _clip(message.get("text"), limit)
         role = "customer" if message.get("role") == "customer" else "agent"
         name = _attr(message.get("name"))
-        at = _attr(message.get("at"))
+        at = _attr(_clean(message.get("at"))[:10])
         attrs = f' role="{role}"'
         if name:
             attrs += f' name="{name}"'
         if at:
             attrs += f' at="{at}"'
         block = f"<message{attrs}>\n{text}\n</message>"
-        if used + len(block) > _MAX_CONVERSATION_CHARS and kept:
-            break
+        if not is_full and used + len(block) > budget:
+            # Older context is optional: the first one that does not fit ends
+            # it (the thread stays contiguous), but a must-keep message older
+            # than that is still taken.
+            over = True
+            continue
         kept.append(block)
         used += len(block)
     if not kept:
@@ -289,26 +350,86 @@ def _conversation_block(conversation: Iterable[dict]) -> str:
     return "<conversation>\n" + "\n".join(reversed(kept)) + "\n</conversation>"
 
 
-def _knowledge_block(excerpts: Iterable[dict], kb_articles: Iterable[dict]) -> str:
+def _knowledge_block(
+    excerpts: Iterable[dict],
+    kb_articles: Iterable[dict],
+    *,
+    cfg: dict = _KNOWLEDGE_WRITE,
+    total_chars: Optional[int] = None,
+) -> str:
     """``excerpts`` are dicts {content, source, help_url} the router prepared
-    from retrieved chunks (help_url already resolved to a full URL)."""
+    from retrieved chunks (help_url already resolved to a full URL). Excerpts
+    are taken first, in the order given, then the support articles, each item
+    whole or not at all, until ``total_chars`` (default cfg["total_chars"])."""
+    limit = cfg["total_chars"] if total_chars is None else min(total_chars, cfg["total_chars"])
     blocks: List[str] = []
-    for i, excerpt in enumerate(excerpts, start=1):
-        content = _clip(excerpt.get("content"), _MAX_EXCERPT_CHARS)
+    used = 0
+
+    def take(block: str) -> bool:
+        nonlocal used
+        if used + len(block) + 1 > limit:
+            return False
+        blocks.append(block)
+        used += len(block) + 1
+        return True
+
+    for i, excerpt in enumerate(list(excerpts)[: cfg["max_excerpts"]], start=1):
+        content = _clip(excerpt.get("content"), cfg["excerpt_chars"])
         if not content:
             continue
         attrs = f' id="{i}" source="{_attr(excerpt.get("source"))}"'
         if _clean(excerpt.get("help_url")):
             attrs += f' help_url="{_attr(excerpt.get("help_url"))}"'
-        blocks.append(f"<excerpt{attrs}>\n{content}\n</excerpt>")
-    for article in kb_articles:
-        text = _clip(article.get("text"), _MAX_ARTICLE_CHARS)
+        if not take(f"<excerpt{attrs}>\n{content}\n</excerpt>"):
+            break
+    for article in list(kb_articles)[: cfg["max_articles"]]:
+        text = _clip(article.get("text"), cfg["article_chars"])
         if not text:
             continue
-        blocks.append(f'<support_article title="{_attr(article.get("title"))}">\n{text}\n</support_article>')
+        if not take(f'<support_article title="{_attr(article.get("title"))}">\n{text}\n</support_article>'):
+            break
     if not blocks:
         return "<knowledge_base>\n(no reference material available)\n</knowledge_base>"
     return "<knowledge_base>\n" + "\n".join(blocks) + "\n</knowledge_base>"
+
+
+def _fit_prompt(
+    *,
+    ticket: dict,
+    conversation: Iterable[dict],
+    excerpts: Iterable[dict],
+    kb_articles: Iterable[dict],
+    tail: str,
+    conversation_chars: int,
+    knowledge_cfg: dict,
+) -> str:
+    """Assemble ticket + conversation + knowledge + tail within _MAX_PROMPT_CHARS.
+
+    The tail (question, or draft + instruction, plus the closing line) is never
+    cut. The context gives way in order: the knowledge block shrinks to what is
+    left after the ticket and the conversation; if that leaves it under
+    knowledge_cfg["min_chars"], the conversation gives up the difference; and
+    only then is the ticket description shortened.
+    """
+    conversation = list(conversation)
+    excerpts = list(excerpts)
+    kb_articles = list(kb_articles)
+    separators = 3 * 2
+    budget = _MAX_PROMPT_CHARS - len(tail) - separators
+
+    ticket_block = _ticket_block(ticket)
+    conv_block = _conversation_block(conversation, budget=conversation_chars)
+    remaining = budget - len(ticket_block) - len(conv_block)
+    if remaining < knowledge_cfg["min_chars"]:
+        shortfall = knowledge_cfg["min_chars"] - remaining
+        conv_block = _conversation_block(conversation, budget=max(600, conversation_chars - shortfall))
+        remaining = budget - len(ticket_block) - len(conv_block)
+    if remaining < 0:
+        short_ticket = dict(ticket, description=_clip(ticket.get("description"), 600))
+        ticket_block = _ticket_block(short_ticket)
+        remaining = budget - len(ticket_block) - len(conv_block)
+    knowledge_block = _knowledge_block(excerpts, kb_articles, cfg=knowledge_cfg, total_chars=max(0, remaining))
+    return "\n\n".join([ticket_block, conv_block, knowledge_block, tail])
 
 
 def build_ask_prompt(
@@ -321,15 +442,20 @@ def build_ask_prompt(
     language: str,
 ) -> str:
     name = _LANG_NAME.get(language, "English")
-    prompt = (
-        f"{_ticket_block(ticket)}\n\n"
-        f"{_conversation_block(conversation)}\n\n"
-        f"{_knowledge_block(excerpts, kb_articles)}\n\n"
+    tail = (
         f"<question>\n{_clean(question)}\n</question>\n\n"
         f"Answer the question for the customer using ONLY the material above, in {name}, "
         "as plain text."
     )
-    return prompt[:_MAX_PROMPT_CHARS]
+    return _fit_prompt(
+        ticket=ticket,
+        conversation=conversation,
+        excerpts=excerpts,
+        kb_articles=kb_articles,
+        tail=tail,
+        conversation_chars=_CONVERSATION_CHARS_ASK,
+        knowledge_cfg=_KNOWLEDGE_ASK,
+    )
 
 
 def build_write_prompt(
@@ -359,15 +485,20 @@ def build_write_prompt(
         if instruction_text
         else "<instruction>\n(empty — polish the draft without changing its meaning)\n</instruction>"
     )
-    prompt = (
-        f"{_ticket_block(ticket)}\n\n"
-        f"{_conversation_block(conversation)}\n\n"
-        f"{_knowledge_block(excerpts, kb_articles)}\n\n"
+    tail = (
         f"{draft_block}\n\n"
         f"{instruction_block}\n\n"
         f"Write the reply to the customer now, in {name}, as plain text."
     )
-    return prompt[:_MAX_PROMPT_CHARS]
+    return _fit_prompt(
+        ticket=ticket,
+        conversation=conversation,
+        excerpts=excerpts,
+        kb_articles=kb_articles,
+        tail=tail,
+        conversation_chars=_CONVERSATION_CHARS_WRITE,
+        knowledge_cfg=_KNOWLEDGE_WRITE,
+    )
 
 
 # ---------------------------------------------------------------------------
