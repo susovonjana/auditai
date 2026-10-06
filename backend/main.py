@@ -27,6 +27,7 @@ from rate_limit import limiter
 from routers import admin as admin_router
 from routers import agent as agent_router
 from routers import copilot as copilot_router
+from routers import document as document_router
 from routers import health as health_router
 from routers import internal as internal_router
 from routers import support as support_router
@@ -123,6 +124,13 @@ async def _warm_up_models() -> None:
 async def lifespan(app: FastAPI):
     """Startup: init DB + seed admin + warm up models. Shutdown: nothing special."""
     logger.info("AuditAI starting up...")
+    # The agent runtime runs compute steps in worker threads; the document reader
+    # persists insights from there by scheduling onto this loop.
+    try:
+        import document_insight_store
+        document_insight_store.set_main_loop(asyncio.get_running_loop())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("document_insight_store loop capture failed: %s", exc)
     try:
         await init_db()
         await _seed_initial_admin()
@@ -173,6 +181,7 @@ app.include_router(health_router.router)
 app.include_router(admin_router.router)
 app.include_router(user_router.router)
 app.include_router(copilot_router.router)
+app.include_router(document_router.router)
 app.include_router(internal_router.router)
 app.include_router(agent_router.router)
 app.include_router(support_router.router)

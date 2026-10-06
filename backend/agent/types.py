@@ -66,6 +66,9 @@ class RunContext:
     # the firm's standard program (a skeleton has no client or risk data). Only
     # needed at START: build_plan and the drafting step run before any pause.
     is_template: bool = False
+    # document-scoped agents (document_extraction): the SELECTED document ids.
+    # Only needed at START — build_plan bakes them into the step args, which persist.
+    document_ids: List[int] = field(default_factory=list)
 
     def find(self, tool: str, **arg_match: Any) -> Optional[Any]:
         """Return the output of an earlier step by tool name (and optional arg

@@ -354,6 +354,52 @@ def complete_structured(
     return StructuredResult(value=schema.model_validate(payload), usage=_usage_from(resp, model))
 
 
+def complete_structured_blocks(
+    system: Optional[str],
+    content: List[Dict[str, Any]],
+    schema: Type[BaseModel],
+    *,
+    tier: str = "smart",
+    temperature: float = 0.0,
+    max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+) -> StructuredResult:
+    """Multimodal variant of ``complete_structured``: the single user turn is a
+    list of Anthropic content blocks instead of a prompt string, so a caller can
+    hand the model page IMAGES / PDF pages next to text (the document reader's
+    vision path — Claude reads scans in any language, no Tesseract needed).
+
+    ``content`` items are plain Messages-API blocks, e.g.
+      {"type": "text", "text": "..."}
+      {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "<b64>"}}
+      {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "<b64>"}}
+    The structured JSON is still obtained via forced tool-use on ``schema``."""
+    tool = {
+        "name": _STRUCTURED_TOOL_NAME,
+        "description": "Return the result as structured data matching the schema.",
+        "input_schema": schema.model_json_schema(),
+    }
+    resp, model = _messages_create(
+        tier=tier,
+        system=system or None,
+        messages=[{"role": "user", "content": content}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": _STRUCTURED_TOOL_NAME},
+    )
+    payload = None
+    for block in getattr(resp, "content", []) or []:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == _STRUCTURED_TOOL_NAME:
+            payload = block.input
+            break
+    if payload is None:
+        raise RuntimeError(
+            "Bedrock returned no structured tool_use output (possibly truncated "
+            "by max_tokens, or blocked). Try a larger token budget."
+        )
+    return StructuredResult(value=schema.model_validate(payload), usage=_usage_from(resp, model))
+
+
 # ---------------------------------------------------------------------------
 # (3) Tool-calling loop (native Anthropic tool use)
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ __all__ = [
     "ToolLoopResult",
     "DEFAULT_MAX_OUTPUT_TOKENS",
     "generate_structured",
+    "generate_structured_from_blocks",
     "run_tool_loop",
     "stream_text",
     "astream_text",
@@ -67,6 +68,35 @@ def generate_structured(
     result = llm.complete_structured(
         system,
         prompt,
+        schema,
+        tier=tier,
+        temperature=temperature,
+        max_tokens=max_output_tokens,
+    )
+    if usage_out is not None:
+        usage_out.update(
+            input=result.usage.input_tokens,
+            output=result.usage.output_tokens,
+            model=result.usage.model,
+        )
+    return result.value
+
+
+def generate_structured_from_blocks(
+    content: List[Dict[str, Any]],
+    schema: Type[BaseModel],
+    temperature: float = 0.0,
+    *,
+    system: Optional[str] = None,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    tier: str = "smart",
+    usage_out: Optional[dict] = None,
+) -> BaseModel:
+    """Like ``generate_structured`` but the user turn is a list of content blocks
+    (text + base64 images / PDF pages) — the document reader's multimodal path."""
+    result = llm.complete_structured_blocks(
+        system,
+        content,
         schema,
         tier=tier,
         temperature=temperature,

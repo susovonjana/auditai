@@ -89,10 +89,21 @@ class CopilotContext:
         # narrative ("which WP discusses going concern?"). Injected by the chat
         # router (retrieval is async; the tool loop is synchronous).
         self.file_search: Optional[Callable[[str], Any]] = None
+        # Optional bridge to the document reader's insight store: the model gets a
+        # get_document_insight tool so "what does invoice INV-123 say?" / a
+        # response grounded in attached evidence can read a document's AI
+        # extraction. Injected by the routers (async DB lookup; the loop is sync).
+        self.document_lookup: Optional[Callable[[str], Any]] = None
         # Serve repeated identical fetches from the short-TTL cache. Enabled only
         # for the chat path (repeated questions), and only AFTER validate_grant()
         # has confirmed this request's grant — so a cache hit never bypasses auth.
         self.use_cache = bool(use_cache)
+        # The AI feature / sub-feature the grant was minted for (claims set by
+        # 1audit-be after its FeatureAccess checks). Filled by validate_grant_local;
+        # routes that belong to ONE feature call require_feature() so a grant
+        # minted for another feature (e.g. chat) cannot drive them.
+        self.grant_feature: Optional[str] = None
+        self.grant_sub_feature: Optional[str] = None
 
     def _cache_key(self, endpoint: str, params: Optional[dict]) -> str:
         items = sorted((params or {}).items())
@@ -180,6 +191,28 @@ class CopilotContext:
             return body["data"]
         return body
 
+    def get_bytes(self, endpoint: str, *, max_bytes: int, read_timeout: Optional[int] = None) -> bytes:
+        """GET {base}/copilot/audit_files/{id}/{endpoint} and return the RAW body
+        (binary). Used by the document reader to pull a document's bytes through
+        1audit-be when the CDN's presigned URLs are not usable. Raises
+        ``requests.RequestException`` on HTTP/network failure and ``ValueError``
+        when the body exceeds ``max_bytes`` (the caller caps the read)."""
+        url = f"{self.base_url}/copilot/audit_files/{self.audit_file_id}/{endpoint}"
+        headers = {"X-Copilot-Grant": self.grant}
+        timeout = (ONEAUDIT_HTTP_CONNECT_TIMEOUT, read_timeout or ONEAUDIT_HTTP_TIMEOUT)
+        resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        resp.raise_for_status()
+        chunks: List[bytes] = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=1024 * 256):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("document exceeds the size cap")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
     def validate_grant(self) -> None:
         """Confirm this request's grant is valid for this file via ONE real
         (uncached) summary fetch. Raises CopilotGrantError on an auth rejection
@@ -222,6 +255,23 @@ class CopilotContext:
                 raise CopilotGrantError("Copilot grant is for a different audit file.")
         except (TypeError, ValueError):
             raise CopilotGrantError("Copilot grant is missing a valid audit_file_id.")
+        self.grant_feature = decoded.get("feature") or None
+        self.grant_sub_feature = decoded.get("sub_feature") or None
+
+    def require_feature(self, feature: str, sub_feature: Optional[str] = None) -> None:
+        """Enforce that the (already validated) grant was minted for ``feature``
+        — and, when given, for ``sub_feature`` too. 1audit-be only mints a grant
+        after its FeatureAccess checks (prime-admin status, org/user allowlist,
+        plan, sub-feature switches), so matching the claim here extends that
+        gate to this endpoint. Raises CopilotGrantError (→ 403 in the routes)."""
+        if self.grant_feature != feature:
+            raise CopilotGrantError(
+                f"This grant was not issued for the '{feature}' feature."
+            )
+        if sub_feature and self.grant_sub_feature != sub_feature:
+            raise CopilotGrantError(
+                f"This grant was not issued for the '{sub_feature}' option of '{feature}'."
+            )
 
 
 def _safe_json(resp) -> Any:
@@ -307,6 +357,15 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
     def list_documents() -> Any:
         return ctx.get("documents")
 
+    def get_document_insight(document: str = "", **_) -> Any:
+        # What ONE uploaded document SAYS — the document reader's structured
+        # extraction (type, parties, amounts, dates, line items, red flags) plus a
+        # text excerpt. Served from the insight store; documents that were never
+        # read return a hint listing the ones that were.
+        if not ctx.document_lookup:
+            return {"error": "document insights are unavailable here"}
+        return ctx.document_lookup(document or "")
+
     def search_standards(query: str = "", **_) -> Any:
         # NOT a file tool — searches the shared knowledge base (auditing
         # standards + 1audit product help). Returns relevant passages so the
@@ -346,6 +405,7 @@ def build_tool_impls(ctx: CopilotContext) -> Dict[str, Callable[..., Any]]:
         "get_engagement_team": get_engagement_team,
         "get_sampling_design": get_sampling_design,
         "list_documents": list_documents,
+        "get_document_insight": get_document_insight,
         "search_standards": search_standards,
         "search_file": search_file,
     }
@@ -596,6 +656,31 @@ TOOL_SPECS: List[ToolSpec] = [
             "Use for 'what documents are attached / supporting evidence' questions."
         ),
         parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="get_document_insight",
+        description=(
+            "What ONE uploaded document on THIS file actually SAYS: the AI reading of "
+            "its content — document type, title, parties (with VAT/CR numbers), dates, "
+            "amounts (subtotal/VAT/total), line items, reference numbers, key facts, "
+            "arithmetic/VAT/period checks, red flags, which working papers it supports — "
+            "plus an excerpt of its text. Look a document up by its reference (e.g. "
+            "'D-12') or (part of) its file name. Use it for 'what is in / what does "
+            "<document> say', to cite evidence when drafting a finding or response, or "
+            "to check an amount against a source document. Only documents already read "
+            "by the AI document reader are available; otherwise the result lists which "
+            "documents have been read."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "document": {
+                    "type": "string",
+                    "description": "The document's reference or (part of) its file name.",
+                }
+            },
+            "required": ["document"],
+        },
     ),
 ]
 
@@ -971,6 +1056,7 @@ def write_with_file(
     usage_out: Optional[dict] = None,
     procedure: Optional[str] = None,
     role: Optional[str] = None,
+    document_lookup: Optional[Callable[[str], Any]] = None,
 ) -> ToolLoopResult:
     """The one grounded writer for every non-procedure field inside an audit file
     (note/findings, response, comment, …), via the tool-calling loop. When a
@@ -979,6 +1065,10 @@ def write_with_file(
     file fact only when the instruction needs one. Returns
     ToolLoopResult(answer, tools_used)."""
     ctx = CopilotContext(audit_file_id, grant, base_url)
+    # Evidence bridge: lets a findings/response draft cite what an attached
+    # document says (the document reader's extraction) instead of only the
+    # file's structured data. Optional — None keeps the historical behaviour.
+    ctx.document_lookup = document_lookup
     impls = build_tool_impls(ctx)
     lang_name = "Arabic" if language == "ar" else "English"
 

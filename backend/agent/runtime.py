@@ -115,6 +115,7 @@ class AgentRuntime:
         style_examples: Optional[List[str]] = None,
         is_template: bool = False,
         defer_advance: bool = False,
+        document_ids: Optional[List[int]] = None,
     ) -> AgentRun:
         copilot = CopilotContext(audit_file_id, grant, base_url=base_url)
         run_ctx = RunContext(
@@ -125,6 +126,7 @@ class AgentRuntime:
             working_paper_id=working_paper_id,
             style_examples=list(style_examples or []),
             is_template=is_template,
+            document_ids=[int(d) for d in (document_ids or [])],
         )
 
         run = AgentRun(

@@ -29,6 +29,7 @@ from embeddings import embed_query
 from rate_limit import limiter
 from routers.user import _load_session, _persist_ask_history
 import copilot_tools
+import document_insight_store
 import file_cache_state
 import file_index
 import proc_memory
@@ -336,6 +337,21 @@ async def write_assist(
         # File-grounded: the tool loop is synchronous (returns the full answer),
         # so we run it off-thread and emit it as one NDJSON delta. The meta event
         # is sent first so the FE clears the editor and the stall-timer is armed.
+        # Evidence bridge for the grounded writer: a findings/response draft can
+        # cite what an attached document SAYS (document reader extraction), not
+        # only the file's structured numbers. Async store read hopped from the
+        # sync tool loop, like kb_search / file_search in /chat.
+        write_loop = asyncio.get_running_loop()
+
+        def document_lookup(query: str):
+            fut = asyncio.run_coroutine_threadsafe(
+                document_insight_store.lookup_for_tool(
+                    payload.audit_file_id, query or "", language=payload.language
+                ),
+                write_loop,
+            )
+            return fut.result(timeout=_FILE_SEARCH_TIMEOUT)
+
         async def grounded_stream():
             yield json.dumps({"type": "meta", "grounded": True}) + "\n"
             try:
@@ -350,6 +366,7 @@ async def write_assist(
                     usage_out=usage,
                     procedure=payload.procedure,
                     role=payload.role,
+                    document_lookup=document_lookup,
                 )
                 answer = _strip_fences(result.answer or "").strip()
                 if answer:
@@ -595,6 +612,17 @@ async def chat_about_file(
         return fut.result(timeout=_FILE_SEARCH_TIMEOUT)
 
     ctx.file_search = file_search
+
+    # Document evidence bridge: "what does invoice INV-123 say?" → the document
+    # reader's stored extraction (same async→thread hop as kb_search/file_search).
+    def document_lookup(query: str):
+        fut = asyncio.run_coroutine_threadsafe(
+            document_insight_store.lookup_for_tool(payload.audit_file_id, query or "", language=language),
+            loop,
+        )
+        return fut.result(timeout=_FILE_SEARCH_TIMEOUT)
+
+    ctx.document_lookup = document_lookup
 
     # No session-start prewarm. The previous digest + index prewarm fired a burst
     # of be requests (and a CPU-heavy index embed) right when the first answer

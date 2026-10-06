@@ -340,6 +340,13 @@ async def start_run(
             status_code=422,
             detail=f"Agent '{payload.agent_type}' requires working_paper_id.",
         )
+    # Document-scoped agents (document_extraction) read ONLY the selected documents —
+    # never the whole file (hundreds of documents = slow + costly).
+    if getattr(definition, "requires_document_ids", False) and not payload.document_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Agent '{payload.agent_type}' requires document_ids (select the documents to read).",
+        )
 
     # Decision C: one active run per file — return the in-flight one if present.
     res = await db.execute(
@@ -373,6 +380,7 @@ async def start_run(
         style_examples=style_examples,
         is_template=payload.is_template,
         defer_advance=True,
+        document_ids=payload.document_ids,
     )
     if run.status == "running":  # planned OK — execute in the background
         bg_ctx = RunContext(
@@ -383,6 +391,7 @@ async def start_run(
             working_paper_id=payload.working_paper_id,
             style_examples=style_examples,
             is_template=payload.is_template,
+            document_ids=[int(d) for d in (payload.document_ids or [])],
         )
         _spawn_bg_advance(run.id, bg_ctx, payload)
     return await _run_out(db, run)

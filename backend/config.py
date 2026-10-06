@@ -69,8 +69,36 @@ FRONTEND_ORIGIN: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 # Base URL of 1audit-be's internal copilot API. The copilot tools HTTP-GET
 # {ONEAUDIT_BASE_URL}/copilot/audit_files/{id}/... presenting an X-Copilot-Grant
 # header. In Docker, reach the host's 1audit-be via host.docker.internal.
-ONEAUDIT_BASE_URL: str = os.getenv(
-    "ONEAUDIT_BASE_URL", "http://localhost:5030/api/v1/internal"
+def _resolve_oneaudit_base_url(raw: str) -> str:
+    """The same .env is used in Docker (where 1audit-be is reached via
+    host.docker.internal) and when uvicorn runs directly on the developer's
+    machine (where that name does not resolve and EVERY be call would fail with
+    'nodename nor servname provided'). If the configured host can't be resolved
+    here, fall back to localhost so a host-run server still reaches be."""
+    import socket
+    from urllib.parse import urlparse, urlunparse
+
+    try:
+        parts = urlparse(raw)
+        host = parts.hostname or ""
+        if host and host != "localhost":
+            socket.gethostbyname(host)
+        return raw
+    except (socket.gaierror, UnicodeError):
+        pass
+    except Exception:  # pragma: no cover - never let URL sniffing break startup
+        return raw
+    netloc = f"localhost:{parts.port}" if parts.port else "localhost"
+    fixed = urlunparse(parts._replace(netloc=netloc))
+    import logging
+    logging.getLogger("config").warning(
+        "ONEAUDIT_BASE_URL host %r does not resolve on this machine; using %s", parts.hostname, fixed
+    )
+    return fixed
+
+
+ONEAUDIT_BASE_URL: str = _resolve_oneaudit_base_url(
+    os.getenv("ONEAUDIT_BASE_URL", "http://localhost:5030/api/v1/internal")
 )
 # Timeout (seconds) for copilot data callbacks to 1audit-be. Some read services
 # (e.g. a lead-sheet-heavy working paper's content) take ~20s, so allow headroom.
@@ -334,6 +362,43 @@ AGENT_ALLOWED_ORG_IDS: set[str] = _csv_set(os.getenv("AGENT_ALLOWED_ORG_IDS", ""
 AGENT_STEP_LIMIT: int = int(os.getenv("AGENT_STEP_LIMIT", "12"))
 AGENT_RUN_TIMEOUT_SEC: int = int(os.getenv("AGENT_RUN_TIMEOUT_SEC", "120"))
 AGENT_MAX_RUN_CREDITS: int = int(os.getenv("AGENT_MAX_RUN_CREDITS", "4000"))
+
+# --- Document reader (per-document AI summary / extraction + the document_extraction agent) ---
+# Master switch for /copilot/document/* (the on-click "AI summary" in All documents).
+# The be FeatureAccess gate at grant mint (feature "agent") is the real per-org gate;
+# this only lets an environment ship dark.
+DOC_READER_ENABLED: bool = os.getenv("DOC_READER_ENABLED", "true").lower() == "true"
+# Vision-first reading: scanned pages / images are sent to Claude as image blocks
+# (multilingual, handles Arabic + handwriting far better than Tesseract). false =
+# text-only (Tesseract OCR fallback from parser.py for scans).
+DOC_READER_VISION_ENABLED: bool = os.getenv("DOC_READER_VISION_ENABLED", "true").lower() == "true"
+# Hard caps so one document can never blow the token budget: pages rendered for
+# vision, longest image edge (px — Claude's sweet spot is ~1568), native text chars
+# sent to the model, bytes downloaded, and the text kept in the insight store for
+# follow-up Q&A / future response grounding.
+DOC_READER_MAX_PAGES: int = int(os.getenv("DOC_READER_MAX_PAGES", "20"))
+DOC_READER_MAX_IMAGE_EDGE: int = int(os.getenv("DOC_READER_MAX_IMAGE_EDGE", "1568"))
+DOC_READER_MAX_TEXT_CHARS: int = int(os.getenv("DOC_READER_MAX_TEXT_CHARS", "60000"))
+DOC_READER_MAX_FILE_MB: int = int(os.getenv("DOC_READER_MAX_FILE_MB", "40"))
+DOC_READER_TEXT_STORE_CHARS: int = int(os.getenv("DOC_READER_TEXT_STORE_CHARS", "200000"))
+# A page whose native text layer is shorter than this is treated as scanned and
+# rendered for vision instead (covers "image-only PDF with a few header glyphs").
+DOC_READER_MIN_TEXT_CHARS_PER_PAGE: int = int(os.getenv("DOC_READER_MIN_TEXT_CHARS_PER_PAGE", "40"))
+# (connect, read) timeout for downloading the presigned S3 URL.
+DOC_READER_DOWNLOAD_TIMEOUT_SEC: int = int(os.getenv("DOC_READER_DOWNLOAD_TIMEOUT_SEC", "90"))
+# The batch agent (document_extraction) reads at most this many documents per run,
+# and stops early once it has spent this much wall-clock so the run never exceeds
+# AGENT_RUN_TIMEOUT_SEC mid-step.
+DOC_READER_MAX_BATCH_DOCS: int = int(os.getenv("DOC_READER_MAX_BATCH_DOCS", "8"))
+DOC_READER_BATCH_TIME_BUDGET_SEC: int = int(os.getenv("DOC_READER_BATCH_TIME_BUDGET_SEC", "100"))
+# Output-token cap for the structured insight (line items + summary can be long).
+DOC_READER_MAX_OUTPUT_TOKENS: int = int(os.getenv("DOC_READER_MAX_OUTPUT_TOKENS", "6000"))
+# Follow-up Q&A over one document: how much of the stored text is handed to the model.
+DOC_READER_ASK_CONTEXT_CHARS: int = int(os.getenv("DOC_READER_ASK_CONTEXT_CHARS", "40000"))
+# DEV ONLY — path of a local file the reader uses INSTEAD of downloading the
+# presigned URL, so the end-to-end UI flow can be exercised on a machine that
+# cannot reach the firm's S3/CloudFront. Never set in dev/beta/prod.
+DOC_READER_DEV_STATIC_FILE: str = os.getenv("DOC_READER_DEV_STATIC_FILE", "") or ""
 
 # --- Security: file encryption at rest ---
 # 32 random URL-safe base64 chars. Generated with:

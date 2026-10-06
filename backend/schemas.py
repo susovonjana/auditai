@@ -312,6 +312,76 @@ class CopilotChatRequest(BaseModel):
 
 
 # =========================================================================
+# Copilot — DOCUMENT READER (per-document AI summary / extraction)
+# =========================================================================
+class DocumentInsightRequest(BaseModel):
+    """Read ONE uploaded document of the granted audit file and return its
+    structured insight (cached per document + UI language). ``document_id`` is
+    what the FE preview holds; ``document_reference`` is the alternative handle."""
+    session_token: str
+    audit_file_id: int
+    copilot_grant: str
+    document_id: Optional[int] = None
+    document_reference: Optional[str] = Field(None, max_length=256)
+    language: str = Field("en", pattern="^(en|ar)$")
+    # true → re-read even when a cached insight exists (e.g. after the model improved)
+    refresh: bool = False
+    # true → never spend tokens: return the cached insight or {insight: null}
+    cached_only: bool = False
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_doc_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+class DocumentAskTurn(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., max_length=4000)
+
+
+class DocumentAskRequest(BaseModel):
+    """Follow-up question about ONE document that has already been read."""
+    session_token: str
+    audit_file_id: int
+    copilot_grant: str
+    document_id: int
+    question: str = Field(..., min_length=1, max_length=2000)
+    history: List[DocumentAskTurn] = Field(default_factory=list, max_length=12)
+    language: str = Field("en", pattern="^(en|ar)$")
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_ask_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+class DocumentInsightListRequest(BaseModel):
+    """Compact per-document entries for the documents LIST badges."""
+    session_token: str
+    audit_file_id: int
+    copilot_grant: str
+    language: str = Field("en", pattern="^(en|ar)$")
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @field_validator("user_id", "organization_id", mode="before")
+    @classmethod
+    def _stringify_list_ids(cls, v):
+        if v is None or v == "":
+            return None
+        return str(v)
+
+
+# =========================================================================
 # Copilot — TB auto-mapping (ticket C-3)
 # =========================================================================
 class TbAccountIn(BaseModel):
@@ -498,6 +568,10 @@ class AgentRunRequest(BaseModel):
     # the procedure agent drafts the firm's STANDARD program instead of a
     # risk-tailored one. Sent by the FE from the template-editing screens.
     is_template: bool = False
+    # scope for document-scoped agents (document_extraction): the documents the
+    # auditor SELECTED. Required by those agents — a file can hold hundreds of
+    # documents, so nothing is ever read wholesale.
+    document_ids: Optional[List[int]] = Field(None, max_length=50)
 
     @field_validator("user_id", "organization_id", mode="before")
     @classmethod

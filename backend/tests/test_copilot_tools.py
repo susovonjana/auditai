@@ -61,3 +61,23 @@ def test_http_error_returns_error_dict(monkeypatch):
     ctx = CopilotContext(1, "bad")
     out = build_tool_impls(ctx)["get_risks"]()
     assert "error" in out
+
+
+def test_grant_feature_claims_and_require_feature(monkeypatch):
+    """validate_grant_local records the feature/sub_feature claims; require_feature
+    enforces them (the per-endpoint extension of 1audit-be's FeatureAccess gate)."""
+    import time
+    import jwt
+    import pytest
+    monkeypatch.setattr(copilot_tools, "COPILOT_GRANT_SECRET", "")
+    token = jwt.encode({"scope": "copilot", "audit_file_id": 7, "feature": "document_ai",
+                        "sub_feature": "ask_document", "exp": int(time.time()) + 60}, "k", algorithm="HS256")
+    ctx = CopilotContext(7, token)
+    ctx.validate_grant_local()
+    assert (ctx.grant_feature, ctx.grant_sub_feature) == ("document_ai", "ask_document")
+    ctx.require_feature("document_ai")
+    ctx.require_feature("document_ai", "ask_document")
+    with pytest.raises(copilot_tools.CopilotGrantError):
+        ctx.require_feature("chat")
+    with pytest.raises(copilot_tools.CopilotGrantError):
+        ctx.require_feature("document_ai", "batch_read")

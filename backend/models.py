@@ -462,3 +462,54 @@ class AuditFileCacheState(Base):
     changed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+# ---------------------------------------------------------------------------
+# Document insights — what the DOCUMENT READER extracted from ONE uploaded
+# audit-file document (the "AI summary" in All documents + the
+# document_extraction agent). Cached per (audit file, document, UI language):
+# re-opening a document is instant, follow-up Q&A reads the stored text instead
+# of re-OCRing, and later features (procedure-response grounding, chat) can
+# cite the document without touching S3. ``content_key`` fingerprints the
+# source (size + updated_at) so a re-uploaded file is re-read, never served stale.
+# Lives ONLY in auditai Postgres — nothing is written back to 1audit.
+# ---------------------------------------------------------------------------
+class DocumentInsightRow(Base):
+    __tablename__ = "aura_document_insights"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    audit_file_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    document_reference: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    document_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    mime_type: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # UI language the prose was written in (en | ar); the extracted text is language-agnostic.
+    language: Mapped[str] = mapped_column(String(8), nullable=False, default="en")
+    # fingerprint of the source bytes' metadata (document_id:size:updated_at)
+    content_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    doc_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    summary_short: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # the full structured insight (DocumentInsight + computed checks)
+    insight: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # native / OCR / vision-derived text kept for Q&A + grounding (capped)
+    extracted_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    read_method: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    pages: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index(
+            "ux_document_insights_file_doc_lang",
+            "audit_file_id", "document_id", "language", unique=True,
+        ),
+        Index("ix_document_insights_org", "organization_id"),
+    )

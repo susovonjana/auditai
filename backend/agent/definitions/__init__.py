@@ -10,5 +10,6 @@ from agent.definitions import risk_assessment  # noqa: F401  (registers "risk_as
 from agent.definitions import review_notes  # noqa: F401  (registers "review_notes")
 from agent.definitions import document_intelligence  # noqa: F401  (registers "document_intelligence")
 from agent.definitions import procedure_buildout  # noqa: F401  (registers "procedure_buildout")
+from agent.definitions import document_extraction  # noqa: F401  (registers "document_extraction")
 
-__all__ = ["file_review", "engagement_buildout", "analytical_review", "substantive_testing", "risk_assessment", "review_notes", "document_intelligence", "procedure_buildout"]
+__all__ = ["file_review", "engagement_buildout", "analytical_review", "substantive_testing", "risk_assessment", "review_notes", "document_intelligence", "procedure_buildout", "document_extraction"]
