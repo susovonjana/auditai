@@ -116,7 +116,11 @@ async def list_insights(
     if organization_id:
         q = q.where(DocumentInsightRow.organization_id == str(organization_id))
     q = q.order_by(DocumentInsightRow.updated_at.desc())
-    rows = (await db.execute(q)).scalars().all()
+    try:
+        rows = (await db.execute(q)).scalars().all()
+    except Exception as exc:  # noqa: BLE001 — badges are optional; never 500 the list
+        logger.warning("document insight list failed (table missing?): %s", exc)
+        return []
     best: Dict[int, DocumentInsightRow] = {}
     for r in rows:
         cur = best.get(r.document_id)

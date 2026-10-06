@@ -157,10 +157,16 @@ async def document_insight(
             # its own short-lived session.
             cached = None
             if doc_id is not None:
-                async with AsyncSessionLocal() as sdb:
-                    cached = await store.get_insight(
-                        sdb, audit_file_id=payload.audit_file_id, document_id=int(doc_id), language=payload.language
-                    )
+                try:
+                    async with AsyncSessionLocal() as sdb:
+                        cached = await store.get_insight(
+                            sdb, audit_file_id=payload.audit_file_id, document_id=int(doc_id), language=payload.language
+                        )
+                except Exception as exc:  # noqa: BLE001 — a cache problem must never break a read
+                    # e.g. the aura_document_insights table not migrated yet on an
+                    # environment: read anyway (uncached) and say so in the logs.
+                    logger.warning("document insight cache lookup failed (reading uncached): %s", exc)
+                    cached = None
             if cached is not None and cached.content_key == key and not payload.refresh:
                 yield _ev({"type": "result", "cached": True, "stale": False,
                            "document": document_reader._compact_meta(meta), **store.row_to_payload(cached)})
